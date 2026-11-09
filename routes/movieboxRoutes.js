@@ -1,4 +1,5 @@
 import express from 'express';
+import https from 'node:https';
 import {
   getMovieboxCatalog,
   getMovieboxDetail,
@@ -73,6 +74,42 @@ router.get('/subtitle', async (req, res) => {
   } catch (error) {
     console.error('Moviebox subtitle convert error:', error.message);
     res.status(500).send('Error loading subtitle');
+  }
+});
+
+// GET /api/moviebox/test-stream-direct - Diagnostic endpoint for video streaming
+router.get('/test-stream-direct', (req, res) => {
+  try {
+    const targetUrl = req.query.url;
+    if (!targetUrl) return res.status(400).json({ error: 'url missing' });
+    const parsed = new URL(targetUrl);
+    const httpsReq = https.get({
+      hostname: parsed.hostname,
+      port: 443,
+      path: parsed.pathname + parsed.search,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Referer': 'https://themoviebox.xyz/',
+        'Range': req.headers.range || 'bytes=0-100'
+      }
+    }, (upRes) => {
+      let chunks = [];
+      upRes.on('data', c => chunks.push(c));
+      upRes.on('end', () => {
+        const buf = Buffer.concat(chunks);
+        res.json({
+          statusCode: upRes.statusCode,
+          headers: upRes.headers,
+          length: buf.length,
+          hex: buf.slice(0, 16).toString('hex')
+        });
+      });
+    });
+    httpsReq.on('error', err => {
+      res.json({ error: err.message, code: err.code });
+    });
+  } catch (err) {
+    res.json({ error: err.message });
   }
 });
 
