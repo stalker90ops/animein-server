@@ -131,8 +131,9 @@ router.get('/lk21/segment', async (req, res) => {
     }
 
     res.status(response.status);
-    res.setHeader('Content-Type', response.headers.get('content-type') || 'video/mp2t');
+    res.setHeader('Content-Type', 'video/mp2t');
     res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Cache-Control', 'public, max-age=86400, s-maxage=86400, immutable');
     if (response.headers.get('content-length')) {
       res.setHeader('Content-Length', response.headers.get('content-length'));
     }
@@ -210,8 +211,13 @@ router.get('/lk21/embed-frame', async (req, res) => {
     let html = await response.text();
     const baseOrigin = new URL(targetUrl).origin;
 
-    // Remove anti-debugger, parent frame checks, ads, and redirection loops
-    html = html.replace(/<script[\s\S]*?(devtoolIsOpening|debugger|window\.parent\.location|yellowishgather)[\s\S]*?<\/script>/gi, '');
+    // Safely remove anti-debugger, parent frame checks, ads, and redirection loops without wiping player scripts
+    html = html.replace(/<script\b[^>]*>([\s\S]*?)<\/script>/gi, (match, inner) => {
+      if (/devtoolIsOpening|window\.self\s*===\s*window\.top|top\.location\s*==\s*self\.location|uyeouyeo|yellowishgather/i.test(inner)) {
+        return '';
+      }
+      return match;
+    });
     html = html.replace(/<a[^>]*id="uyeouyeo"[\s\S]*?<\/a>/gi, '');
     html = html.replace(/if\s*\(\s*window\.self\s*===\s*window\.top\s*\)[\s\S]*?}/gi, '');
     html = html.replace(/if\s*\(\s*top\.location\s*==\s*self\.location[\s\S]*?}/gi, '');

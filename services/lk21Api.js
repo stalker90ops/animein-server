@@ -45,6 +45,13 @@ function toLk21GenreSlug(g) {
   return clean.replace(/\s+/g, '-');
 }
 
+// Helper to normalize rating
+function cleanRating(r) {
+  const num = parseFloat(r) || 7.5;
+  if (num > 10) return (num / 10).toFixed(1);
+  return num > 0 ? num.toFixed(1) : '7.5';
+}
+
 // In-memory cache for resolved stream URLs (TTL: 2 hours)
 const streamCache = new Map();
 const CACHE_TTL_MS = 2 * 60 * 60 * 1000;
@@ -136,177 +143,171 @@ function parseArticles(html) {
 
 // 1. Get LK21 Movie List by category, genre(s), year, or search (filters out trailers by default)
 export async function getLk21Movies({ category = 'populer', genre = '', genres = '', page = 1, includeTrailers = false, year = '', search = '' } = {}) {
+  const p = Math.max(1, parseInt(page) || 1);
+  const pageSize = 24;
   const genreList = (genres || genre || '')
     .split(',')
     .map(g => g.trim())
     .filter(g => g && g !== 'All');
 
-  // Direct JSON Search via LK21's gudangvape search API
+  // Direct Search Mode
   if (search && search.trim()) {
+    const q = search.trim().toLowerCase();
+    // Search in our verified offline catalog first
+    const catalogMatches = Object.values(lk21StreamsCatalog).filter(m => {
+      const matchTitle = (m.title || '').toLowerCase().includes(q);
+      const matchSlug = (m.slug || '').toLowerCase().includes(q);
+      const matchGenre = (m.genres || '').toLowerCase().includes(q);
+      const matchCast = (m.cast || '').toLowerCase().includes(q);
+      const matchYear = !year || String(m.year) === String(year);
+      return (matchTitle || matchSlug || matchGenre || matchCast) && matchYear;
+    });
+
+    // Also query gudangvape search API for live results
+    let apiMatches = [];
     try {
-      const searchUrl = `${LK21_SEARCH_API}?s=${encodeURIComponent(search.trim())}&page=${page || 1}`;
+      const searchUrl = `${LK21_SEARCH_API}?s=${encodeURIComponent(search.trim())}&page=${p}`;
       const res = await fetch(searchUrl, {
         headers: {
           'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
           'Origin': LK21_BASE,
           'Referer': `${LK21_BASE}/`
         },
-        signal: AbortSignal.timeout(10000)
+        signal: AbortSignal.timeout(8000)
       });
-
       if (res.ok) {
         const json = await res.json();
-        const items = json?.data || json?.items || [];
-        let list = items
-          .filter(item => !item.type || item.type === 'movie')
-          .map(item => {
-            const slug = String(item.slug || '').replace(/^\//, '').replace(/\/$/, '');
-            const rawTitle = decodeEntities(item.title || slug);
-            const rawQuality = String(item.quality || 'HD').toUpperCase();
-            const isTrailer = rawQuality.toLowerCase().includes('trailer') ||
-                              rawTitle.toLowerCase().includes('trailer') ||
-                              slug.toLowerCase().includes('trailer') ||
-                              slug.toLowerCase().includes('teaser');
-            const posterUrl = item.poster
-              ? (item.poster.startsWith('http') ? item.poster : `${LK21_POSTER_BASE}${item.poster.replace(/^\//, '')}`)
-              : '';
-            const itemYear = item.year ? String(item.year) : ((rawTitle.match(/\((\d{4})\)/) || [])[1] || '');
-
+        const items = json?.data || [];
+        apiMatches = items
+          .filter(it => !it.type || it.type === 'movie')
+          .map(it => {
+            const slug = String(it.slug || '').replace(/^\//, '').replace(/\/$/, '');
+            const catEntry = lk21StreamsCatalog[slug];
+            const rawTitle = decodeEntities(it.title || slug);
+            const posterUrl = it.poster
+              ? (it.poster.startsWith('http') ? it.poster : `${LK21_POSTER_BASE}${it.poster.replace(/^\//, '')}`)
+              : (catEntry?.poster || '');
             return {
               id: `lk21_${slug}`,
               source: 'lk21',
               slug,
-              title: rawTitle,
+              title: catEntry?.title || rawTitle,
               poster: posterUrl,
-              rating: item.rating && Number(item.rating) > 0 ? String(item.rating) : '7.5',
-              genres: genreList.length > 0 ? genreList.join(', ') : 'Movie, LK21',
-              year: itemYear,
-              quality: rawQuality || 'HD',
-              isTrailer,
-              url: `${LK21_BASE}/${slug}`
-            };
-          });
-
-        if (year && /^\d{4}$/.test(String(year))) {
-          list = list.filter(m => String(m.year) === String(year) || m.title.includes(String(year)));
-        }
-        if (!includeTrailers) {
-          list = list.filter(m => !m.isTrailer);
-        }
-        return list;
-      }
-    } catch (err) {
-      console.error('Error in LK21 JSON search API:', err.message);
-    }
-  }
-
-  // Build native LK21 multi-filter or category URL
-  const hasMultiFilter = (genreList.length >= 2) || (genreList.length >= 1 && year && /^\d{4}$/.test(String(year)));
-  let targetUrl = LK21_BASE;
-
-  if (hasMultiFilter) {
-    const baseOrder = category === 'rating' ? 'rating' : category === 'latest' ? 'latest' : category === 'release' ? 'release' : 'populer';
-    let pathParts = [baseOrder, 'type', 'movie'];
-    if (genreList[0]) pathParts.push('genre1', toLk21GenreSlug(genreList[0]));
-    if (genreList[1]) pathParts.push('genre2', toLk21GenreSlug(genreList[1]));
-    if (year && /^\d{4}$/.test(String(year))) pathParts.push('year', String(year));
-    if (page > 1) pathParts.push('page', String(page));
-    targetUrl = `${LK21_BASE}/${pathParts.join('/')}/`;
-  } else if (year && /^\d{4}$/.test(String(year))) {
-    targetUrl = `${LK21_BASE}/year/${year}/`;
-    if (page > 1) targetUrl += `page/${page}/`;
-  } else if (genreList.length === 1) {
-    const cleanGenre = toLk21GenreSlug(genreList[0]);
-    targetUrl = `${LK21_BASE}/genre/${cleanGenre}/`;
-    if (page > 1) targetUrl += `page/${page}/`;
-  } else if (category === 'rating') {
-    targetUrl = `${LK21_BASE}/rating/`;
-    if (page > 1) targetUrl += `page/${page}/`;
-  } else if (category === 'latest') {
-    targetUrl = `${LK21_BASE}/latest/`;
-    if (page > 1) targetUrl += `page/${page}/`;
-  } else if (category === 'release') {
-    targetUrl = `${LK21_BASE}/release/`;
-    if (page > 1) targetUrl += `page/${page}/`;
-  } else {
-    targetUrl = `${LK21_BASE}/populer/`;
-    if (page > 1) targetUrl += `page/${page}/`;
-  }
-
-  try {
-    const html = await curlFetch(targetUrl);
-    let list = parseArticles(html);
-
-    // If user selected 3+ genres, filter remaining genres in-memory against full itemprop="genre"
-    if (genreList.length > 2) {
-      list = list.filter(m =>
-        genreList.slice(2).every(g => (m.genres || '').toLowerCase().includes(g.toLowerCase()))
-      );
-    }
-    if (year && /^\d{4}$/.test(String(year))) {
-      list = list.filter(m => !m.year || String(m.year) === String(year) || m.title.includes(String(year)));
-    }
-
-    if (!list || list.length === 0) {
-      // Fall back to direct LK21 JSON API
-      const searchTerms = ['a', 'the', '2025', '2026', '2024'];
-      const term = searchTerms[(page - 1) % searchTerms.length] || 'a';
-      const searchRes = await fetch(`${LK21_SEARCH_API}?s=${term}&page=${page || 1}`, {
-        headers: {
-          'Origin': LK21_BASE,
-          'Referer': `${LK21_BASE}/`,
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        },
-        signal: AbortSignal.timeout(8000)
-      }).catch(() => null);
-
-      if (searchRes && searchRes.ok) {
-        const json = await searchRes.json().catch(() => null);
-        const items = json?.data || json?.items || [];
-        list = items
-          .filter(item => !item.type || item.type === 'movie')
-          .map(item => {
-            const slug = String(item.slug || '').replace(/^\//, '').replace(/\/$/, '');
-            const rawTitle = decodeEntities(item.title || slug);
-            const posterUrl = item.poster
-              ? (item.poster.startsWith('http') ? item.poster : `${LK21_POSTER_BASE}${item.poster.replace(/^\//, '')}`)
-              : '';
-            const itemYear = item.year ? String(item.year) : ((rawTitle.match(/\((\d{4})\)/) || [])[1] || '');
-            return {
-              id: `lk21_${slug}`,
-              source: 'lk21',
-              slug,
-              title: rawTitle,
-              poster: posterUrl,
-              rating: item.rating && Number(item.rating) > 0 ? String(item.rating) : '7.5',
-              genres: lk21StreamsCatalog[slug]?.genres || (genreList.length > 0 ? genreList.join(', ') : 'Movie, LK21'),
-              year: itemYear,
-              quality: String(item.quality || 'HD').toUpperCase(),
+              rating: cleanRating(it.rating || catEntry?.rating),
+              genres: catEntry?.genres || (genreList.length > 0 ? genreList.join(', ') : 'Movie, LK21'),
+              year: it.year ? String(it.year) : (catEntry?.year || ''),
+              quality: String(it.quality || catEntry?.quality || 'HD').toUpperCase(),
               isTrailer: false,
               url: `${LK21_BASE}/${slug}`
             };
           });
+      }
+    } catch (e) {
+      console.warn('LK21 search API error:', e.message);
+    }
 
-        // Filter by requested genres if user selected a genre on Vercel
-        if (genreList.length > 0) {
-          const filtered = list.filter(m =>
-            genreList.every(g => (m.genres || '').toLowerCase().includes(g.toLowerCase()))
-          );
-          if (filtered.length > 0) {
-            list = filtered;
-          }
-        }
+    const seen = new Set();
+    const merged = [];
+    for (const m of [...catalogMatches, ...apiMatches]) {
+      if (!seen.has(m.slug)) {
+        seen.add(m.slug);
+        merged.push(m);
       }
     }
-
-    if (!includeTrailers) {
-      return list.filter(m => !m.isTrailer);
-    }
-    return list;
-  } catch (error) {
-    console.error(`Error fetching LK21 movies (${targetUrl}):`, error.message);
-    return [];
+    return merged.slice((p - 1) * pageSize, p * pageSize);
   }
+
+  // Browse Catalog Pool (584 movies with pre-resolved stream servers)
+  let catalogPool = Object.values(lk21StreamsCatalog);
+
+  // Genre filtering
+  if (genreList.length > 0) {
+    catalogPool = catalogPool.filter(m =>
+      genreList.every(g => (m.genres || '').toLowerCase().includes(g.toLowerCase()))
+    );
+  }
+
+  // Year filtering
+  if (year && /^\d{4}$/.test(String(year))) {
+    catalogPool = catalogPool.filter(m => String(m.year) === String(year) || (m.title || '').includes(String(year)));
+  }
+
+  // Sorting
+  if (category === 'rating') {
+    catalogPool.sort((a, b) => parseFloat(cleanRating(b.rating)) - parseFloat(cleanRating(a.rating)));
+  } else {
+    // Populer / Latest / Release: prioritize recent years (2026, 2025, 2024), then rating
+    catalogPool.sort((a, b) => {
+      const ya = parseInt(a.year) || 0;
+      const yb = parseInt(b.year) || 0;
+      if (yb !== ya) return yb - ya;
+      return parseFloat(cleanRating(b.rating)) - parseFloat(cleanRating(a.rating));
+    });
+  }
+
+  const startIdx = (p - 1) * pageSize;
+  const paginatedCatalog = catalogPool.slice(startIdx, startIdx + pageSize);
+
+  // If we have enough movies in this page, return immediately
+  if (paginatedCatalog.length >= pageSize || (catalogPool.length > 0 && paginatedCatalog.length > 0 && genreList.length > 0)) {
+    return paginatedCatalog;
+  }
+
+  // If page exceeds our verified cache or catalogPool is exhausted, query live API
+  try {
+    const queryYear = (year && /^\d{4}$/.test(String(year))) ? String(year) : (category === 'rating' ? '2025' : '2026');
+    const apiPage = Math.max(1, p - Math.floor(catalogPool.length / pageSize));
+    const searchUrl = `${LK21_SEARCH_API}?s=${queryYear}&page=${apiPage}`;
+    const res = await fetch(searchUrl, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Origin': LK21_BASE,
+        'Referer': `${LK21_BASE}/`
+      },
+      signal: AbortSignal.timeout(8000)
+    });
+    if (res.ok) {
+      const json = await res.json();
+      const items = json?.data || [];
+      const apiItems = items
+        .filter(it => !it.type || it.type === 'movie')
+        .map(it => {
+          const slug = String(it.slug || '').replace(/^\//, '').replace(/\/$/, '');
+          const catEntry = lk21StreamsCatalog[slug];
+          const rawTitle = decodeEntities(it.title || slug);
+          const posterUrl = it.poster
+            ? (it.poster.startsWith('http') ? it.poster : `${LK21_POSTER_BASE}${it.poster.replace(/^\//, '')}`)
+            : (catEntry?.poster || '');
+          return {
+            id: `lk21_${slug}`,
+            source: 'lk21',
+            slug,
+            title: catEntry?.title || rawTitle,
+            poster: posterUrl,
+            rating: cleanRating(it.rating || catEntry?.rating),
+            genres: catEntry?.genres || (genreList.length > 0 ? genreList.join(', ') : 'Movie, LK21'),
+            year: it.year ? String(it.year) : (catEntry?.year || queryYear),
+            quality: String(it.quality || catEntry?.quality || 'HD').toUpperCase(),
+            isTrailer: false,
+            url: `${LK21_BASE}/${slug}`
+          };
+        });
+
+      const seen = new Set(paginatedCatalog.map(m => m.slug));
+      const combined = [...paginatedCatalog];
+      for (const item of apiItems) {
+        if (!seen.has(item.slug)) {
+          seen.add(item.slug);
+          combined.push(item);
+        }
+      }
+      return combined.slice(0, pageSize);
+    }
+  } catch (err) {
+    console.warn('LK21 live API fallback error:', err.message);
+  }
+
+  return paginatedCatalog;
 }
 
 // 2. Resolve direct HLS m3u8 stream from LK21 embed URL
@@ -572,6 +573,11 @@ export async function getLk21MovieDetail(slug) {
 
     const cachedEntry = lk21StreamsCatalog[slug];
     if (cachedEntry) {
+      if (cachedEntry.title) finalTitle = cachedEntry.title;
+      if (cachedEntry.poster) finalPoster = cachedEntry.poster;
+      if (cachedEntry.rating) finalRating = cleanRating(cachedEntry.rating);
+      if (cachedEntry.year) finalYear = cachedEntry.year;
+      if (cachedEntry.quality) finalQuality = cachedEntry.quality;
       if (!finalSynopsis && cachedEntry.synopsis) finalSynopsis = cachedEntry.synopsis;
       if ((!finalGenres || finalGenres === 'Action, Film Bioskop') && cachedEntry.genres) finalGenres = cachedEntry.genres;
       if (!finalCountry && cachedEntry.country) finalCountry = cachedEntry.country;
