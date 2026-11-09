@@ -2,7 +2,9 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import fs from 'node:fs';
 import os from 'node:os';
+import { createRequire } from 'node:module';
 
+const require = createRequire(import.meta.url);
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
@@ -10,7 +12,7 @@ let dbInstance = null;
 let activeDbPath = ':memory:';
 
 try {
-  const sqlite = await import('node:sqlite');
+  const sqlite = require('node:sqlite');
   if (sqlite && sqlite.DatabaseSync) {
     let resolvedPath = path.join(__dirname, 'animein.db');
     if (process.env.VERCEL) {
