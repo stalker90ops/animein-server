@@ -422,55 +422,78 @@ export async function getMovieboxDetail(subjectId, detailPath = '') {
 /**
  * Get playable streams, resolutions, soft subtitles, and download links
  */
-export async function getMovieboxStream({ subjectId, detailPath = '', se = 0, ep = 0 }) {
+export async function getMovieboxStream({ subjectId, detailPath = '', se = 0, ep = 0, title = '' }) {
   if (!subjectId) return { success: false, message: 'subjectId wajib disertakan' };
 
   try {
-    // If detailPath is not provided, fetch it from detail first
-    let actualDetailPath = detailPath;
-    if (!actualDetailPath) {
-      const detail = await getMovieboxDetail(subjectId);
-      if (detail.success && detail.data.detailPath) {
-        actualDetailPath = detail.data.detailPath;
-      }
-    }
-
     const curSe = Number(se) || 0;
     const curEp = curSe === 0 ? 0 : (Number(ep) || 1);
+
+    // Parallel fetch: detail metadata + play streams for minimal latency
+    const detailPromise = (title && detailPath)
+      ? Promise.resolve({ success: true, data: { title, detailPath, type: curSe > 0 ? 'series' : 'movie' } })
+      : getMovieboxDetail(subjectId, detailPath).catch(() => null);
+
+    const playUrl = `/wefeed-h5api-bff/subject/play?subjectId=${subjectId}&se=${curSe}&ep=${curEp}&detailPath=${detailPath || ''}&streamSignType=0`;
+    const playPromise = apiRequest(playUrl, {
+      headers: {
+        'Origin': 'https://mzfi.me',
+        'Referer': `https://mzfi.me/spa/videoPlayPage/movies/${detailPath || 'watch'}?id=${subjectId}&type=/movie/detail&detailSe=${curSe}&detailEp=${curEp}&lang=id`
+      }
+    }).catch(() => null);
+
+    const [movieDetailRes, playRes] = await Promise.all([detailPromise, playPromise]);
+    const movieDetail = movieDetailRes?.data || null;
+    const resolvedTitle = title || movieDetail?.title || '';
+    const actualDetailPath = detailPath || movieDetail?.detailPath || '';
+    const isSeries = movieDetail?.type === 'series' || curSe > 0;
     const embedUrl = `https://mzfi.me/spa/videoPlayPage/movies/${actualDetailPath}?id=${subjectId}&type=/movie/detail&detailSe=${curSe}&detailEp=${curEp}&lang=id`;
 
-    // 1. Look up IMDb ID to provide high-speed multi-server embeds (VidSrc, 2Embed, etc.)
-    const movieDetail = await getMovieboxDetail(subjectId, actualDetailPath);
-    const movieTitle = movieDetail?.data?.title || '';
-    const isSeries = movieDetail?.data?.type === 'series';
-    const imdbId = await getImdbIdFromTitle(movieTitle);
+    // Fast IMDb ID lookup (cached in memory)
+    const imdbId = await getImdbIdFromTitle(resolvedTitle);
 
     const embedServers = [];
     if (imdbId) {
       if (isSeries) {
+        // Fast Server 1: VidSrc.to (Very fast v2 player)
         embedServers.push({
-          id: 'vidsrc_sh',
-          name: 'Server 1 (VidSrc HD)',
+          id: 'vidsrc_to',
+          name: 'Server 1 (VidSrc Fast 1080p)',
           quality: '1080p',
           resolution: '1080',
           type: 'embed',
           isDirect: false,
           isPrimary: true,
           isDefault: true,
-          link: `https://vidsrc.sh/embed/tv?imdb=${imdbId}&season=${curSe || 1}&episode=${curEp || 1}`
+          link: `https://vidsrc.to/embed/tv/${imdbId}/${curSe || 1}/${curEp || 1}`
         });
+
+        // Fast Server 2: MultiEmbed VIP (Aggregator with multi-CDN)
+        embedServers.push({
+          id: 'multiembed',
+          name: 'Server 2 (MultiEmbed VIP)',
+          quality: '1080p',
+          resolution: '1080',
+          type: 'embed',
+          isDirect: false,
+          link: `https://multiembed.mov/?video_id=${imdbId}&s=${curSe || 1}&e=${curEp || 1}`
+        });
+
+        // Server 3: VidSrc PM
         embedServers.push({
           id: 'vidsrc_pm',
-          name: 'Server 2 (VidSrc PM)',
+          name: 'Server 3 (VidSrc PM)',
           quality: '1080p',
           resolution: '1080',
           type: 'embed',
           isDirect: false,
           link: `https://vidsrc.pm/embed/tv?imdb=${imdbId}&season=${curSe || 1}&episode=${curEp || 1}`
         });
+
+        // Server 4: 2Embed HD
         embedServers.push({
           id: 'twoembed',
-          name: 'Server 3 (2Embed HD)',
+          name: 'Server 4 (2Embed HD)',
           quality: '1080p',
           resolution: '1080',
           type: 'embed',
@@ -478,29 +501,45 @@ export async function getMovieboxStream({ subjectId, detailPath = '', se = 0, ep
           link: `https://www.2embed.cc/embedtv/${imdbId}&s=${curSe || 1}&e=${curEp || 1}`
         });
       } else {
+        // Fast Server 1: VidSrc.to (Very fast v2 player)
         embedServers.push({
-          id: 'vidsrc_sh',
-          name: 'Server 1 (VidSrc HD)',
+          id: 'vidsrc_to',
+          name: 'Server 1 (VidSrc Fast 1080p)',
           quality: '1080p',
           resolution: '1080',
           type: 'embed',
           isDirect: false,
           isPrimary: true,
           isDefault: true,
-          link: `https://vidsrc.sh/embed/movie?imdb=${imdbId}`
+          link: `https://vidsrc.to/embed/movie/${imdbId}`
         });
+
+        // Fast Server 2: MultiEmbed VIP (Aggregator with multi-CDN)
+        embedServers.push({
+          id: 'multiembed',
+          name: 'Server 2 (MultiEmbed VIP)',
+          quality: '1080p',
+          resolution: '1080',
+          type: 'embed',
+          isDirect: false,
+          link: `https://multiembed.mov/?video_id=${imdbId}`
+        });
+
+        // Server 3: VidSrc PM
         embedServers.push({
           id: 'vidsrc_pm',
-          name: 'Server 2 (VidSrc PM)',
+          name: 'Server 3 (VidSrc PM)',
           quality: '1080p',
           resolution: '1080',
           type: 'embed',
           isDirect: false,
           link: `https://vidsrc.pm/embed/movie?imdb=${imdbId}`
         });
+
+        // Server 4: 2Embed HD
         embedServers.push({
           id: 'twoembed',
-          name: 'Server 3 (2Embed HD)',
+          name: 'Server 4 (2Embed HD)',
           quality: '1080p',
           resolution: '1080',
           type: 'embed',
@@ -524,19 +563,10 @@ export async function getMovieboxStream({ subjectId, detailPath = '', se = 0, ep
       format: 'EMBED'
     });
 
-    // 2. Request playback streams from MovieBox API for direct MP4 and Soft Subtitles
-    const playUrl = `/wefeed-h5api-bff/subject/play?subjectId=${subjectId}&se=${curSe}&ep=${curEp}&detailPath=${actualDetailPath}&streamSignType=0`;
-    const playRes = await apiRequest(playUrl, {
-      headers: {
-        'Origin': 'https://mzfi.me',
-        'Referer': embedUrl
-      }
-    });
-
     const streams = playRes?.data?.streams || [];
     const hls = playRes?.data?.hls || [];
 
-    // 3. Fetch Soft Subtitles
+    // Fetch Soft Subtitles
     let captions = [];
     const streamIdForCaption = streams.find(s => s.id)?.id || hls[0]?.id;
     if (streamIdForCaption) {
@@ -547,12 +577,11 @@ export async function getMovieboxStream({ subjectId, detailPath = '', se = 0, ep
           'Origin': 'https://mzfi.me',
           'Referer': embedUrl
         }
-      });
+      }).catch(() => null);
       captions = capRes?.data?.captions || [];
     }
 
-    // 3. Format Playable Streams
-    // Order resolutions from highest (1080p -> 480p -> 360p)
+    // Format Playable Direct Streams
     const directServers = streams
       .filter(s => s.url && !s.vipLocked)
       .map(s => {
@@ -562,7 +591,6 @@ export async function getMovieboxStream({ subjectId, detailPath = '', se = 0, ep
           name: `Server Direct (${res})`,
           quality: res,
           resolution: s.resolutions,
-          // Proxy URL to bypass CORS and anti-hotlinking
           link: `/api/moviebox/stream-proxy?url=${encodeURIComponent(s.url)}`,
           rawLink: s.url,
           type: 'direct',
@@ -577,43 +605,35 @@ export async function getMovieboxStream({ subjectId, detailPath = '', se = 0, ep
 
     const formattedServers = [...embedServers, ...directServers];
 
-    // 4. Format Soft Subtitles
+    // Format Soft Subtitles
     const formattedSubtitles = captions.map(c => {
       const isIndo = c.lan === 'in_id' || c.lan === 'id';
-      const isEng = c.lan === 'en';
       return {
         id: c.id,
         lan: c.lan,
         lanName: c.lanName || (isIndo ? 'Bahasa Indonesia' : c.lan.toUpperCase()),
         rawUrl: c.url,
-        // Converted VTT proxy endpoint for HTML5 <track> support
         vttUrl: `/api/moviebox/subtitle?url=${encodeURIComponent(c.url)}&lang=${c.lan}`,
-        downloadUrl: c.url,
-        isDefault: isIndo // Prefer Indonesian subtitle as default
+        isDefault: isIndo
       };
     });
 
-    // Make sure Indonesian comes first in subtitle list
     formattedSubtitles.sort((a, b) => (b.isDefault ? 1 : 0) - (a.isDefault ? 1 : 0));
 
     return {
       success: true,
+      title: resolvedTitle,
       subjectId: String(subjectId),
       detailPath: actualDetailPath,
       season: curSe,
       episode: curEp,
       imdbId: imdbId || '',
       servers: formattedServers,
-      subtitles: formattedSubtitles,
-      downloads: streams.map(s => ({
-        quality: s.resolutions ? `${s.resolutions}p` : 'HD',
-        url: s.url,
-        size: s.size
-      }))
+      subtitles: formattedSubtitles
     };
   } catch (error) {
     console.error('[MovieboxService] Stream error:', error);
-    return { success: false, message: error.message, streams: [], subtitles: [] };
+    return { success: false, message: error.message, servers: [], subtitles: [] };
   }
 }
 

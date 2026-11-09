@@ -43,7 +43,7 @@ router.get('/detail/:id', async (req, res) => {
 router.get('/stream/:id', async (req, res) => {
   try {
     const { id } = req.params;
-    const { detailPath = '', se = 0, ep = 0 } = req.query;
+    const { detailPath = '', se = 0, ep = 0, title = '' } = req.query;
     if (!id) {
       return res.status(400).json({ success: false, message: 'ID film/series wajib disertakan' });
     }
@@ -51,7 +51,8 @@ router.get('/stream/:id', async (req, res) => {
       subjectId: id,
       detailPath,
       se: Number(se) || 0,
-      ep: Number(ep) || 0
+      ep: Number(ep) || 0,
+      title
     });
     res.json(result);
   } catch (error) {
