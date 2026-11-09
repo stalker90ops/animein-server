@@ -223,6 +223,50 @@ export async function getNontondramaSeries({ category = 'latest', genre = '', ge
     if (year && /^\d{4}$/.test(String(year))) {
       list = list.filter(m => !m.year || String(m.year) === String(year) || m.title.includes(String(year)));
     }
+
+    if (!list || list.length === 0) {
+      // Fall back to direct Nontondrama JSON API
+      const searchTerms = ['a', 'the', '2025', '2026', 'love'];
+      const term = searchTerms[(page - 1) % searchTerms.length] || 'a';
+      const searchRes = await fetch(`${NONTONDRAMA_SEARCH_API}?s=${term}&page=${page || 1}`, {
+        headers: {
+          'Origin': NONTONDRAMA_BASE,
+          'Referer': `${NONTONDRAMA_BASE}/`,
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        },
+        signal: AbortSignal.timeout(8000)
+      }).catch(() => null);
+
+      if (searchRes && searchRes.ok) {
+        const json = await searchRes.json().catch(() => null);
+        const items = json?.data || json?.items || [];
+        list = items
+          .filter(item => item.type === 'series' || item.season || item.episode)
+          .map(item => {
+            const slug = String(item.slug || '').replace(/^\//, '').replace(/\/$/, '');
+            const rawTitle = decodeEntities(item.title || slug);
+            const posterUrl = item.poster
+              ? (item.poster.startsWith('http') ? item.poster : `${NONTONDRAMA_POSTER_BASE}${item.poster.replace(/^\//, '')}`)
+              : '';
+            const itemYear = item.year ? String(item.year) : ((rawTitle.match(/\((\d{4})\)/) || [])[1] || '');
+            return {
+              id: `series_${slug}`,
+              source: 'nontondrama',
+              slug,
+              title: rawTitle,
+              poster: posterUrl,
+              rating: item.rating && Number(item.rating) > 0 ? String(item.rating) : '7.8',
+              genres: 'Drama, TV Series',
+              year: itemYear,
+              totalEpisodes: item.episode || 'TBA',
+              isCompleted: item.is_complete === 1,
+              status: item.is_complete === 1 ? 'Completed' : 'Ongoing',
+              url: `${NONTONDRAMA_BASE}/${slug}`
+            };
+          });
+      }
+    }
+
     return list;
   } catch (error) {
     console.error(`Error fetching nontondrama series (${targetUrl}):`, error.message);

@@ -232,6 +232,48 @@ export async function getLk21Movies({ category = 'populer', genre = '', genres =
       list = list.filter(m => !m.year || String(m.year) === String(year) || m.title.includes(String(year)));
     }
 
+    if (!list || list.length === 0) {
+      // Fall back to direct LK21 JSON API
+      const searchTerms = ['a', 'the', '2025', '2026', '2024'];
+      const term = searchTerms[(page - 1) % searchTerms.length] || 'a';
+      const searchRes = await fetch(`${LK21_SEARCH_API}?s=${term}&page=${page || 1}`, {
+        headers: {
+          'Origin': LK21_BASE,
+          'Referer': `${LK21_BASE}/`,
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        },
+        signal: AbortSignal.timeout(8000)
+      }).catch(() => null);
+
+      if (searchRes && searchRes.ok) {
+        const json = await searchRes.json().catch(() => null);
+        const items = json?.data || json?.items || [];
+        list = items
+          .filter(item => !item.type || item.type === 'movie')
+          .map(item => {
+            const slug = String(item.slug || '').replace(/^\//, '').replace(/\/$/, '');
+            const rawTitle = decodeEntities(item.title || slug);
+            const posterUrl = item.poster
+              ? (item.poster.startsWith('http') ? item.poster : `${LK21_POSTER_BASE}${item.poster.replace(/^\//, '')}`)
+              : '';
+            const itemYear = item.year ? String(item.year) : ((rawTitle.match(/\((\d{4})\)/) || [])[1] || '');
+            return {
+              id: `lk21_${slug}`,
+              source: 'lk21',
+              slug,
+              title: rawTitle,
+              poster: posterUrl,
+              rating: item.rating && Number(item.rating) > 0 ? String(item.rating) : '7.5',
+              genres: genreList.length > 0 ? genreList.join(', ') : 'Movie, LK21',
+              year: itemYear,
+              quality: String(item.quality || 'HD').toUpperCase(),
+              isTrailer: false,
+              url: `${LK21_BASE}/${slug}`
+            };
+          });
+      }
+    }
+
     if (!includeTrailers) {
       return list.filter(m => !m.isTrailer);
     }
