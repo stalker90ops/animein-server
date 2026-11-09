@@ -1,10 +1,26 @@
 import { DatabaseSync } from 'node:sqlite';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import fs from 'node:fs';
+import os from 'node:os';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-const dbPath = path.join(__dirname, 'animein.db');
+
+// In Vercel serverless, root directory is read-only, so use /tmp
+let dbPath = path.join(__dirname, 'animein.db');
+if (process.env.VERCEL) {
+  try {
+    const tmpDb = path.join(os.tmpdir(), 'animein.db');
+    if (!fs.existsSync(tmpDb) && fs.existsSync(dbPath)) {
+      fs.copyFileSync(dbPath, tmpDb);
+    }
+    dbPath = tmpDb;
+  } catch (e) {
+    console.warn('Could not copy db to /tmp, using :memory: fallback:', e.message);
+    dbPath = ':memory:';
+  }
+}
 
 export const db = new DatabaseSync(dbPath);
 
