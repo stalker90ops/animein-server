@@ -15,8 +15,10 @@ import fs from 'node:fs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-// Support standalone distribution folder as well as repo layout
-const distPath = fs.existsSync(path.join(__dirname, 'dist'))
+// Support public, dist, or repo client/dist
+const distPath = fs.existsSync(path.join(__dirname, 'public', 'index.html'))
+  ? path.join(__dirname, 'public')
+  : fs.existsSync(path.join(__dirname, 'dist'))
   ? path.join(__dirname, 'dist')
   : path.join(__dirname, '../client/dist');
 
