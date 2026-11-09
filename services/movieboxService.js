@@ -20,11 +20,11 @@ function apiRequest(endpoint, options = {}) {
 
     const headers = {
       'Accept': 'application/json, text/plain, */*',
-      'Origin': 'https://themoviebox.xyz',
-      'Referer': 'https://themoviebox.xyz/',
+      'Origin': 'https://mzfi.me',
+      'Referer': options.headers?.Referer || 'https://mzfi.me/',
       'User-Agent': USER_AGENT,
       'X-Client-Info': JSON.stringify({ timezone: 'Asia/Jakarta' }),
-      'X-Vip-Restrict': '0',
+      'X-Vip-Restrict': '1',
       ...(options.headers || {})
     };
 
@@ -401,39 +401,44 @@ export async function getMovieboxStream({ subjectId, detailPath = '', se = 0, ep
 
     const curSe = Number(se) || 0;
     const curEp = curSe === 0 ? 0 : (Number(ep) || 1);
+    const embedUrl = `https://mzfi.me/spa/videoPlayPage/movies/${actualDetailPath}?id=${subjectId}&type=/movie/detail&detailSe=${curSe}&detailEp=${curEp}&lang=id`;
 
     // 1. Request playback streams from MovieBox API
     const playUrl = `/wefeed-h5api-bff/subject/play?subjectId=${subjectId}&se=${curSe}&ep=${curEp}&detailPath=${actualDetailPath}&streamSignType=0`;
     const playRes = await apiRequest(playUrl, {
       headers: {
-        'Origin': 'https://themoviebox.xyz',
-        'Referer': `https://themoviebox.xyz/movies/${actualDetailPath}?id=${subjectId}`
+        'Origin': 'https://mzfi.me',
+        'Referer': embedUrl
       }
     });
 
     const streams = playRes?.data?.streams || [];
     const hls = playRes?.data?.hls || [];
 
-    if (!streams.length && !hls.length) {
-      return {
-        success: false,
-        message: 'Server video tidak tersedia untuk judul ini saat ini.',
-        streams: [],
-        subtitles: [],
-        downloads: []
-      };
-    }
+    // Official Embedded Player (Always works across mobile/desktop/datacenter without CORS or IP block)
+    const embedServer = {
+      id: `mb_embed_${subjectId}_${curSe}_${curEp}`,
+      name: 'Server MovieBox (HD Multi-Sub)',
+      quality: '1080p',
+      resolution: '1080',
+      type: 'embed',
+      isDirect: false,
+      isPrimary: true,
+      isDefault: true,
+      link: embedUrl,
+      format: 'EMBED'
+    };
 
     // 2. Fetch Soft Subtitles
     let captions = [];
-    const streamIdForCaption = streams[0]?.id || hls[0]?.id;
+    const streamIdForCaption = streams.find(s => s.id)?.id || hls[0]?.id;
     if (streamIdForCaption) {
       const capFormat = hls.length > 0 ? 'HLS' : 'MP4';
       const captionUrl = `/wefeed-h5api-bff/subject/caption?format=${capFormat}&id=${streamIdForCaption}&subjectId=${subjectId}&detailPath=${actualDetailPath}`;
       const capRes = await apiRequest(captionUrl, {
         headers: {
-          'Origin': 'https://themoviebox.xyz',
-          'Referer': `https://themoviebox.xyz/movies/${actualDetailPath}?id=${subjectId}`
+          'Origin': 'https://mzfi.me',
+          'Referer': embedUrl
         }
       });
       captions = capRes?.data?.captions || [];
@@ -441,18 +446,20 @@ export async function getMovieboxStream({ subjectId, detailPath = '', se = 0, ep
 
     // 3. Format Playable Streams
     // Order resolutions from highest (1080p -> 480p -> 360p)
-    const formattedServers = streams
+    const directServers = streams
       .filter(s => s.url && !s.vipLocked)
       .map(s => {
         const res = s.resolutions ? `${s.resolutions}p` : 'HD';
         return {
-          id: s.id,
-          name: `Server ${res}`,
+          id: String(s.id),
+          name: `Server Direct (${res})`,
           quality: res,
           resolution: s.resolutions,
           // Proxy URL to bypass CORS and anti-hotlinking
           link: `/api/moviebox/stream-proxy?url=${encodeURIComponent(s.url)}`,
           rawLink: s.url,
+          type: 'direct',
+          isDirect: true,
           format: s.format || 'MP4',
           duration: s.duration || 0,
           size: s.size || 0,
@@ -460,6 +467,8 @@ export async function getMovieboxStream({ subjectId, detailPath = '', se = 0, ep
         };
       })
       .sort((a, b) => parseInt(b.resolution || 0, 10) - parseInt(a.resolution || 0, 10));
+
+    const formattedServers = [embedServer, ...directServers];
 
     // 4. Format Soft Subtitles
     const formattedSubtitles = captions.map(c => {
@@ -539,8 +548,8 @@ export function proxyVideoStream(req, res, targetUrl) {
   const parsedUrl = new URL(targetUrl);
   const clientHeaders = {
     'User-Agent': USER_AGENT,
-    'Referer': 'https://themoviebox.xyz/',
-    'Origin': 'https://themoviebox.xyz'
+    'Referer': 'https://mzfi.me/',
+    'Origin': 'https://mzfi.me'
   };
 
   if (req.headers.range) {
@@ -552,8 +561,15 @@ export function proxyVideoStream(req, res, targetUrl) {
     port: 443,
     path: parsedUrl.pathname + parsedUrl.search,
     method: 'GET',
-    headers: clientHeaders
+    headers: clientHeaders,
+    timeout: 15000
   }, (proxyRes) => {
+    // If upstream returns error status (like 426 or 429 on datacenter IPs), redirect directly to targetUrl
+    if (proxyRes.statusCode >= 400 && proxyRes.statusCode !== 416) {
+      console.warn(`[MovieboxService] Stream proxy upstream returned ${proxyRes.statusCode}, redirecting to raw URL`);
+      return res.redirect(302, targetUrl);
+    }
+
     res.status(proxyRes.statusCode);
 
     // Forward necessary video streaming headers
@@ -571,7 +587,7 @@ export function proxyVideoStream(req, res, targetUrl) {
   proxyReq.on('error', (err) => {
     console.warn('[MovieboxService] Stream proxy error:', err.message);
     if (!res.headersSent) {
-      res.status(502).send('Stream proxy connection error');
+      res.redirect(302, targetUrl);
     }
   });
 
