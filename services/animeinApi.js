@@ -1,40 +1,79 @@
-const BASE_URL = 'https://animeinweb.com/api/proxy';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+
+const execFileAsync = promisify(execFile);
+
+const DIRECT_API_URL = 'https://xyz-api.animein.net';
+const PROXY_BASE_URL = 'https://animeinweb.com/api/proxy';
 const PROXY_SECRET = 'animein-secure-proxy-key-123';
 const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 
-const defaultHeaders = {
-  'User-Agent': USER_AGENT,
-  'x-proxy-secret': PROXY_SECRET,
-  'Accept': 'application/json, text/plain, */*'
-};
+async function curlJson(targetUrl, extraHeaders = []) {
+  const curlCmd = process.platform === 'win32' ? 'curl.exe' : 'curl';
+  const args = [
+    '-s',
+    '-L',
+    '--max-time', '15',
+    '-H', `User-Agent: ${USER_AGENT}`,
+    '-H', 'Referer: https://animeinweb.com/',
+    '-H', 'Accept: application/json, text/plain, */*',
+    ...extraHeaders,
+    targetUrl
+  ];
+  const { stdout } = await execFileAsync(curlCmd, args, { maxBuffer: 10 * 1024 * 1024 });
+  if (!stdout || !stdout.trim().startsWith('{')) {
+    throw new Error('Non-JSON response from curl');
+  }
+  return JSON.parse(stdout);
+}
 
 export async function fetchFromAnimeIn(endpoint, params = {}) {
-  try {
-    const url = new URL(`${BASE_URL}${endpoint}`);
+  const buildUrl = (base) => {
+    const u = new URL(`${base}${endpoint}`);
     Object.keys(params).forEach(key => {
       if (params[key] !== undefined && params[key] !== null) {
-        url.searchParams.append(key, params[key]);
+        u.searchParams.append(key, params[key]);
       }
     });
+    return u.toString();
+  };
 
-    const response = await fetch(url.toString(), {
-      headers: defaultHeaders
-    });
+  const directUrl = buildUrl(DIRECT_API_URL);
+  const proxyUrl = buildUrl(PROXY_BASE_URL);
 
-    if (!response.ok) {
-      throw new Error(`AnimeIn API error: ${response.status} ${response.statusText}`);
+  // 1. Primary: Direct xyz-api.animein.net via curl (works on Vercel Serverless & Local)
+  try {
+    const json = await curlJson(directUrl);
+    if (!json.error && json.data !== undefined) {
+      return json.data;
     }
+  } catch (_) {}
 
-    const data = await response.json();
-    if (data.error) {
-      throw new Error(data.message || 'Error from AnimeIn API');
+  // 2. Secondary: animeinweb.com/api/proxy via curl
+  try {
+    const json = await curlJson(proxyUrl, ['-H', `x-proxy-secret: ${PROXY_SECRET}`]);
+    if (!json.error && json.data !== undefined) {
+      return json.data;
     }
+  } catch (_) {}
 
-    return data.data;
-  } catch (error) {
-    console.error(`Failed to fetch from AnimeIn [${endpoint}]:`, error.message);
-    throw error;
+  // 3. Fallback: Native fetch to directUrl then proxyUrl
+  for (const [target, headers] of [
+    [directUrl, { 'User-Agent': USER_AGENT, 'Referer': 'https://animeinweb.com/', 'Accept': 'application/json' }],
+    [proxyUrl, { 'User-Agent': USER_AGENT, 'Referer': 'https://animeinweb.com/', 'x-proxy-secret': PROXY_SECRET, 'Accept': 'application/json' }]
+  ]) {
+    try {
+      const response = await fetch(target, { headers, signal: AbortSignal.timeout(10000) });
+      if (response.ok) {
+        const data = await response.json();
+        if (!data.error && data.data !== undefined) {
+          return data.data;
+        }
+      }
+    } catch (_) {}
   }
+
+  throw new Error(`AnimeIn API unreachable for ${endpoint}`);
 }
 
 // 1. Home data (Slider, Hot, New, Today, Popular, Random)

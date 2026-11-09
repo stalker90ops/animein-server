@@ -16,17 +16,41 @@ const router = express.Router();
 // Helper to format image URLs through local proxy & cache
 function formatImageUrl(url) {
   if (!url || typeof url !== 'string') return '';
-  if (url.includes('animein.net') || url.includes('/assets/')) {
-    // If it's a relative path, make it absolute first
-    const fullUrl = url.startsWith('http') ? url : `https://api.animein.net${url}`;
+  const trimmed = url.trim();
+  if (!trimmed || trimmed === '_large.jpg' || trimmed === 'null' || trimmed === 'undefined') return '';
+
+  // Unwrap if already proxied or double-proxied
+  if (trimmed.includes('image-proxy?url=')) {
+    try {
+      let inner = trimmed;
+      while (inner.includes('image-proxy?url=')) {
+        const idx = inner.indexOf('image-proxy?url=');
+        inner = decodeURIComponent(inner.substring(idx + 'image-proxy?url='.length));
+      }
+      if (inner.startsWith('http')) {
+        return `/api/anime/image-proxy?url=${encodeURIComponent(inner)}`;
+      }
+    } catch (_) {}
+    if (trimmed.startsWith('/api/anime/image-proxy?url=')) {
+      return trimmed;
+    }
+  }
+
+  if (trimmed.includes('animein.net') || trimmed.includes('/assets/') || trimmed.includes('/assets_xyz/')) {
+    let fullUrl = trimmed;
+    if (!trimmed.startsWith('http')) {
+      const host = trimmed.includes('/assets_xyz/') ? 'https://xyz-api.animein.net' : 'https://api.animein.net';
+      fullUrl = `${host}${trimmed.startsWith('/') ? '' : '/'}${trimmed}`;
+    }
     return `/api/anime/image-proxy?url=${encodeURIComponent(fullUrl)}`;
   }
-  return url;
+  return trimmed;
 }
 
 // Helper to format video URLs through local proxy to bypass Cloudflare hotlink protection
 function formatVideoUrl(url) {
   if (!url || typeof url !== 'string') return '';
+  if (url.startsWith('/api/anime/video-proxy')) return url;
   if (url.includes('storages.animein.net') || url.includes('animein.net') || (url.startsWith('http') && url.endsWith('.mp4'))) {
     return `/api/anime/video-proxy?url=${encodeURIComponent(url)}`;
   }
@@ -54,8 +78,18 @@ router.get('/video-proxy', (req, res) => {
   ];
 
   if (range) {
-    const cleanRange = range.replace('bytes=', '');
+    let cleanRange = range.replace('bytes=', '').trim();
+    // On Vercel Serverless, cap open-ended or large ranges to 3MB chunks to stay under 4.5MB Lambda payload limit
+    if (process.env.VERCEL) {
+      const [startStr, endStr] = cleanRange.split('-');
+      const start = parseInt(startStr, 10) || 0;
+      const maxChunk = 3 * 1024 * 1024 - 1; // ~3MB
+      const end = endStr ? Math.min(parseInt(endStr, 10), start + maxChunk) : (start + maxChunk);
+      cleanRange = `${start}-${end}`;
+    }
     curlArgs.push('-r', cleanRange);
+  } else if (process.env.VERCEL) {
+    curlArgs.push('-r', `0-${3 * 1024 * 1024 - 1}`);
   }
 
   curlArgs.push(url);
@@ -580,23 +614,18 @@ router.get('/:id', async (req, res) => {
     let movie = null;
     let episodes = [];
 
-    try {
-      const [detailData, epData] = await Promise.all([
-        getMovieDetail(id),
-        getAllMovieEpisodes(id)
-      ]);
-      movie = detailData?.movie;
-      episodes = (epData?.episode || []).map(ep => ({
-        id: ep.id,
-        anime_id: ep.id_movie,
-        episode_number: ep.index,
-        title: ep.title,
-        views: ep.views,
-        release_date: ep.key_time,
-        thumbnail: formatImageUrl(ep.image || movie?.image_poster)
-      }));
-    } catch (remoteErr) {
-      console.warn(`Remote anime detail for ${id} failed, checking SQLite fallback:`, remoteErr.message);
+    const validImg = (img) =>
+      img && typeof img === 'string' && img !== '_large.jpg' && (img.includes('/') || img.startsWith('http'))
+        ? img
+        : '';
+
+    const [detailSettled, epSettled] = await Promise.allSettled([
+      getMovieDetail(id),
+      getAllMovieEpisodes(id)
+    ]);
+
+    if (detailSettled.status === 'fulfilled' && detailSettled.value?.movie) {
+      movie = detailSettled.value.movie;
     }
 
     if (!movie) {
@@ -623,6 +652,18 @@ router.get('/:id', async (req, res) => {
       } catch (_) {}
     }
 
+    if (epSettled.status === 'fulfilled' && epSettled.value?.episode?.length) {
+      episodes = epSettled.value.episode.map(ep => ({
+        id: ep.id,
+        anime_id: ep.id_movie,
+        episode_number: ep.index,
+        title: ep.title,
+        views: ep.views,
+        release_date: ep.key_time,
+        thumbnail: formatImageUrl(validImg(ep.image) || validImg(movie?.image_cover) || validImg(movie?.image_poster))
+      }));
+    }
+
     if (!episodes || episodes.length === 0) {
       try {
         const localEps = db.prepare('SELECT * FROM episodes WHERE anime_id = ? ORDER BY CAST(episode_number AS REAL) ASC').all(parseInt(id) || 0);
@@ -634,7 +675,7 @@ router.get('/:id', async (req, res) => {
             title: ep.title || `Episode ${ep.episode_number}`,
             views: '1000',
             release_date: ep.release_date || '',
-            thumbnail: formatImageUrl(ep.thumbnail || movie?.image_poster)
+            thumbnail: formatImageUrl(validImg(ep.thumbnail) || validImg(movie?.image_cover) || validImg(movie?.image_poster))
           }));
         }
       } catch (_) {}
