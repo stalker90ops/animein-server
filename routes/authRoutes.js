@@ -10,6 +10,42 @@ function hashPassword(password, salt) {
   return crypto.scryptSync(password, salt, 64).toString('hex');
 }
 
+// Resilient user resolver: matches exact email, exact username, display_name, or prefix
+export function findUserByIdentifier(rawIdentifier) {
+  if (!rawIdentifier) return null;
+  const clean = String(rawIdentifier).trim().toLowerCase();
+  const userPart = clean.includes('@') ? clean.split('@')[0] : clean;
+
+  // 1. Direct exact match on email or username
+  let user = db.prepare(`
+    SELECT * FROM users 
+    WHERE (email IS NOT NULL AND LOWER(email) = ?) 
+       OR LOWER(username) = ?
+  `).get(clean, clean);
+  if (user) return user;
+
+  // 2. If input is email, match on username == userPart OR display_name == userPart OR username LIKE userPart%
+  if (clean.includes('@')) {
+    user = db.prepare(`
+      SELECT * FROM users 
+      WHERE LOWER(username) = ? 
+         OR (display_name IS NOT NULL AND LOWER(display_name) = ?)
+         OR (email IS NULL AND LOWER(username) LIKE ?)
+    `).get(userPart, userPart, `${userPart}%`);
+    if (user) return user;
+  } else {
+    // 3. If input is username, match display_name or username prefix
+    user = db.prepare(`
+      SELECT * FROM users 
+      WHERE (display_name IS NOT NULL AND LOWER(display_name) = ?)
+         OR LOWER(username) LIKE ?
+    `).get(clean, `${clean}%`);
+    if (user) return user;
+  }
+
+  return null;
+}
+
 // Migrate guest bookmarks and watch history to logged in user
 function migrateGuestData(guestUserId, targetUsername) {
   if (!guestUserId || !targetUsername || guestUserId === targetUsername) return;
@@ -184,11 +220,7 @@ router.post('/login', (req, res) => {
     }
 
     // Look up by email or username
-    let user = db.prepare(`
-      SELECT * FROM users 
-      WHERE (email IS NOT NULL AND LOWER(email) = ?) 
-         OR LOWER(username) = ?
-    `).get(identifier, identifier);
+    let user = findUserByIdentifier(identifier);
 
     // Resiliency: If running on fresh serverless cold-start container on Vercel
     // where local SQLite does not yet have this user, re-create from clientCachedUser
@@ -274,35 +306,32 @@ router.post('/logout', (req, res) => {
 // POST /api/auth/forgot-password (Request 6-digit OTP to Email)
 router.post('/forgot-password', async (req, res) => {
   try {
-    const { email = '' } = req.body;
-    const cleanEmail = String(email || '').trim().toLowerCase();
+    const { email = '', identifier: rawIdent = '' } = req.body;
+    const input = String(email || rawIdent || '').trim();
+    const cleanEmail = input.toLowerCase();
 
     if (!cleanEmail) {
-      return res.status(400).json({ success: false, message: 'Alamat email wajib diisi.' });
+      return res.status(400).json({ success: false, message: 'Alamat email atau username wajib diisi.' });
     }
 
-    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanEmail)) {
-      return res.status(400).json({ success: false, message: 'Format alamat email tidak valid.' });
-    }
-
-    // Find user by email or username
-    let user = db.prepare(`
-      SELECT id, username, email, display_name FROM users 
-      WHERE (email IS NOT NULL AND LOWER(email) = ?) 
-         OR LOWER(username) = ?
-    `).get(cleanEmail, cleanEmail);
+    // Find user by email, username, or display_name
+    let user = findUserByIdentifier(cleanEmail);
 
     if (!user) {
       return res.status(404).json({
         success: false,
-        message: 'Alamat email tidak ditemukan. Pastikan email yang Anda masukkan sudah terdaftar.'
+        message: 'Alamat email atau akun tidak ditemukan. Pastikan email atau username yang Anda masukkan sudah terdaftar.'
       });
     }
 
-    // If user didn't have email saved, link this email to their account
-    if (!user.email) {
+    // Determine target email
+    const targetEmail = cleanEmail.includes('@') ? cleanEmail : (user.email || `${user.username}@animein.local`);
+
+    // If input has '@' and user has no email or different email, link it!
+    if (cleanEmail.includes('@') && (!user.email || user.email.toLowerCase() !== cleanEmail)) {
       try {
         db.prepare('UPDATE users SET email = ? WHERE id = ?').run(cleanEmail, user.id);
+        user.email = cleanEmail;
       } catch (_) {}
     }
 
@@ -312,30 +341,38 @@ router.post('/forgot-password', async (req, res) => {
 
     // Delete older OTPs for this email to avoid confusion
     try {
-      db.prepare('DELETE FROM password_resets WHERE LOWER(email) = ?').run(cleanEmail);
+      db.prepare('DELETE FROM password_resets WHERE LOWER(email) = ? OR LOWER(email) = ?').run(cleanEmail, targetEmail);
     } catch (_) {}
 
     // Store OTP in database
     db.prepare(`
       INSERT INTO password_resets (email, otp, expires_at)
       VALUES (?, ?, ?)
-    `).run(cleanEmail, otp, expiresAt);
+    `).run(targetEmail, otp, expiresAt);
+    if (cleanEmail !== targetEmail) {
+      db.prepare(`
+        INSERT INTO password_resets (email, otp, expires_at)
+        VALUES (?, ?, ?)
+      `).run(cleanEmail, otp, expiresAt);
+    }
 
     // Send email
-    const emailResult = await sendOtpEmail(cleanEmail, otp, user.display_name || user.username);
+    const emailResult = await sendOtpEmail(targetEmail, otp, user.display_name || user.username);
 
     if (emailResult.isSimulated) {
       return res.json({
         success: true,
         isSimulated: true,
         simulatedOtp: otp,
+        email: targetEmail,
         message: `Kode OTP verifikasi berhasil dibuat! Karena server email (SMTP) belum dikonfigurasi di dashboard hosting, Anda dapat menggunakan kode OTP berikut: ${otp}`
       });
     }
 
     res.json({
       success: true,
-      message: `Kode verifikasi OTP 6 digit telah dikirim ke ${cleanEmail}. Silakan periksa kotak masuk atau folder spam email Anda.`
+      email: targetEmail,
+      message: `Kode verifikasi OTP 6 digit telah dikirim ke ${targetEmail}. Silakan periksa kotak masuk atau folder spam email Anda.`
     });
   } catch (error) {
     console.error('Forgot password error:', error);
@@ -351,19 +388,27 @@ router.post('/reset-password', (req, res) => {
     const cleanOtp = String(otp || '').trim();
 
     if (!cleanEmail || !cleanOtp || !newPassword) {
-      return res.status(400).json({ success: false, message: 'Email, kode OTP, dan kata sandi baru wajib diisi.' });
+      return res.status(400).json({ success: false, message: 'Email / username, kode OTP, dan kata sandi baru wajib diisi.' });
     }
 
     if (newPassword.length < 4) {
       return res.status(400).json({ success: false, message: 'Kata sandi baru minimal 4 karakter.' });
     }
 
+    // Find user first
+    const user = findUserByIdentifier(cleanEmail);
+    if (!user) {
+      return res.status(404).json({ success: false, message: 'Akun dengan email atau username tersebut tidak ditemukan.' });
+    }
+
+    const userEmail = (user.email || '').toLowerCase();
+
     // Verify OTP record
     const resetRecord = db.prepare(`
       SELECT * FROM password_resets 
-      WHERE LOWER(email) = ? AND otp = ?
+      WHERE (LOWER(email) = ? OR LOWER(email) = ?) AND otp = ?
       ORDER BY id DESC LIMIT 1
-    `).get(cleanEmail, cleanOtp);
+    `).get(cleanEmail, userEmail, cleanOtp);
 
     if (!resetRecord) {
       return res.status(400).json({
@@ -384,20 +429,15 @@ router.post('/reset-password', (req, res) => {
     const salt = crypto.randomBytes(16).toString('hex');
     const passwordHash = hashPassword(newPassword, salt);
 
-    const updateResult = db.prepare(`
-      UPDATE users 
-      SET password_hash = ?, salt = ? 
-      WHERE (email IS NOT NULL AND LOWER(email) = ?) 
-         OR LOWER(username) = ?
-    `).run(passwordHash, salt, cleanEmail, cleanEmail);
-
-    if (updateResult.changes === 0) {
-      return res.status(404).json({ success: false, message: 'Akun dengan email tersebut tidak ditemukan.' });
+    if (cleanEmail.includes('@') && !user.email) {
+      db.prepare('UPDATE users SET password_hash = ?, salt = ?, email = ? WHERE id = ?').run(passwordHash, salt, cleanEmail, user.id);
+    } else {
+      db.prepare('UPDATE users SET password_hash = ?, salt = ? WHERE id = ?').run(passwordHash, salt, user.id);
     }
 
     // Invalidate used OTP
     try {
-      db.prepare('DELETE FROM password_resets WHERE LOWER(email) = ?').run(cleanEmail);
+      db.prepare('DELETE FROM password_resets WHERE LOWER(email) = ? OR LOWER(email) = ?').run(cleanEmail, userEmail);
     } catch (_) {}
 
     res.json({
