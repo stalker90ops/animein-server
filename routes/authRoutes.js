@@ -1,6 +1,7 @@
 import express from 'express';
 import crypto from 'node:crypto';
 import { db } from '../database/db.js';
+import { sendOtpEmail } from '../services/emailService.js';
 
 const router = express.Router();
 
@@ -71,28 +72,44 @@ function migrateGuestData(guestUserId, targetUsername) {
   }
 }
 
-// POST /api/auth/register
+// POST /api/auth/register (Email & Password registration)
 router.post('/register', (req, res) => {
   try {
-    const { username = '', password = '', displayName = '', guestUserId = '' } = req.body;
+    const { email = '', username = '', password = '', displayName = '', guestUserId = '' } = req.body;
 
-    const cleanUser = username.trim().toLowerCase();
-    const cleanName = displayName.trim() || cleanUser;
+    const cleanEmail = email.trim().toLowerCase();
+    let cleanUser = username.trim().toLowerCase();
+
+    // If username not provided, generate from email
+    if (!cleanUser && cleanEmail) {
+      cleanUser = cleanEmail.split('@')[0].replace(/[^a-zA-Z0-9_]/g, '_');
+    }
+
+    const cleanName = displayName.trim() || cleanUser || cleanEmail.split('@')[0];
+
+    if (cleanEmail && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanEmail)) {
+      return res.status(400).json({ success: false, message: 'Format alamat email tidak valid.' });
+    }
 
     if (!cleanUser || cleanUser.length < 3) {
-      return res.status(400).json({ success: false, message: 'Username minimal 3 karakter.' });
+      return res.status(400).json({ success: false, message: 'Username atau email minimal 3 karakter.' });
     }
-    if (!/^[a-zA-Z0-9_]+$/.test(cleanUser)) {
-      return res.status(400).json({ success: false, message: 'Username hanya boleh huruf, angka, dan garis bawah (_).' });
-    }
+
     if (!password || password.length < 4) {
       return res.status(400).json({ success: false, message: 'Kata sandi minimal 4 karakter.' });
     }
 
-    // Check duplicate
-    const existing = db.prepare('SELECT id FROM users WHERE LOWER(username) = ?').get(cleanUser);
+    // Check duplicate username or email
+    const existing = db.prepare(`
+      SELECT id, username, email FROM users 
+      WHERE LOWER(username) = ? OR (email IS NOT NULL AND LOWER(email) = ?)
+    `).get(cleanUser, cleanEmail || cleanUser);
+
     if (existing) {
-      return res.status(400).json({ success: false, message: 'Username sudah digunakan. Silakan gunakan yang lain.' });
+      if (cleanEmail && existing.email && existing.email.toLowerCase() === cleanEmail) {
+        return res.status(400).json({ success: false, message: 'Email sudah terdaftar. Silakan gunakan menu Lupa Password jika lupa kata sandi.' });
+      }
+      return res.status(400).json({ success: false, message: 'Username atau email sudah digunakan.' });
     }
 
     const salt = crypto.randomBytes(16).toString('hex');
@@ -100,11 +117,10 @@ router.post('/register', (req, res) => {
     const avatar = `https://api.dicebear.com/7.x/bottts/svg?seed=${encodeURIComponent(cleanUser)}`;
 
     const result = db.prepare(`
-      INSERT INTO users (username, password_hash, salt, display_name, avatar)
-      VALUES (?, ?, ?, ?, ?)
-    `).run(cleanUser, passwordHash, salt, cleanName, avatar);
+      INSERT INTO users (username, email, password_hash, salt, display_name, avatar)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `).run(cleanUser, cleanEmail || null, passwordHash, salt, cleanName, avatar);
 
-    // Auto-migrate guest data if available
     if (guestUserId) {
       migrateGuestData(guestUserId, cleanUser);
     }
@@ -112,6 +128,7 @@ router.post('/register', (req, res) => {
     const newUser = {
       id: Number(result.lastInsertRowid),
       username: cleanUser,
+      email: cleanEmail || null,
       displayName: cleanName,
       avatar,
       createdAt: new Date().toISOString()
@@ -128,34 +145,40 @@ router.post('/register', (req, res) => {
   }
 });
 
-// POST /api/auth/login
+// POST /api/auth/login (Login with Email or Username + Password)
 router.post('/login', (req, res) => {
   try {
-    const { username = '', password = '', guestUserId = '' } = req.body;
-    const cleanUser = username.trim().toLowerCase();
+    const { email = '', username = '', password = '', guestUserId = '' } = req.body;
+    const identifier = (email || username || '').trim().toLowerCase();
 
-    if (!cleanUser || !password) {
-      return res.status(400).json({ success: false, message: 'Username dan kata sandi wajib diisi.' });
+    if (!identifier || !password) {
+      return res.status(400).json({ success: false, message: 'Email / Username dan kata sandi wajib diisi.' });
     }
 
-    const user = db.prepare('SELECT * FROM users WHERE LOWER(username) = ?').get(cleanUser);
+    // Look up by email or username
+    const user = db.prepare(`
+      SELECT * FROM users 
+      WHERE (email IS NOT NULL AND LOWER(email) = ?) 
+         OR LOWER(username) = ?
+    `).get(identifier, identifier);
+
     if (!user) {
-      return res.status(401).json({ success: false, message: 'Username atau kata sandi salah.' });
+      return res.status(401).json({ success: false, message: 'Email atau kata sandi tidak sesuai.' });
     }
 
     const testHash = hashPassword(password, user.salt);
     if (testHash !== user.password_hash) {
-      return res.status(401).json({ success: false, message: 'Username atau kata sandi salah.' });
+      return res.status(401).json({ success: false, message: 'Email atau kata sandi tidak sesuai.' });
     }
 
-    // Auto-migrate guest data if user had bookmarks/history as guest
-    if (guestUserId && guestUserId !== cleanUser) {
-      migrateGuestData(guestUserId, cleanUser);
+    if (guestUserId && guestUserId !== user.username) {
+      migrateGuestData(guestUserId, user.username);
     }
 
     const userPayload = {
       id: user.id,
       username: user.username,
+      email: user.email || (identifier.includes('@') ? identifier : null),
       displayName: user.display_name || user.username,
       avatar: user.avatar || `https://api.dicebear.com/7.x/bottts/svg?seed=${encodeURIComponent(user.username)}`,
       createdAt: user.created_at
@@ -172,20 +195,155 @@ router.post('/login', (req, res) => {
   }
 });
 
+// POST /api/auth/forgot-password (Request 6-digit OTP to Email)
+router.post('/forgot-password', async (req, res) => {
+  try {
+    const { email = '' } = req.body;
+    const cleanEmail = String(email || '').trim().toLowerCase();
+
+    if (!cleanEmail) {
+      return res.status(400).json({ success: false, message: 'Alamat email wajib diisi.' });
+    }
+
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanEmail)) {
+      return res.status(400).json({ success: false, message: 'Format alamat email tidak valid.' });
+    }
+
+    // Find user by email or username
+    let user = db.prepare(`
+      SELECT id, username, email, display_name FROM users 
+      WHERE (email IS NOT NULL AND LOWER(email) = ?) 
+         OR LOWER(username) = ?
+    `).get(cleanEmail, cleanEmail);
+
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        message: 'Alamat email tidak ditemukan. Pastikan email yang Anda masukkan sudah terdaftar.'
+      });
+    }
+
+    // If user didn't have email saved, link this email to their account
+    if (!user.email) {
+      try {
+        db.prepare('UPDATE users SET email = ? WHERE id = ?').run(cleanEmail, user.id);
+      } catch (_) {}
+    }
+
+    // Generate 6-digit numeric OTP
+    const otp = Math.floor(100000 + Math.random() * 900000).toString();
+    const expiresAt = new Date(Date.now() + 15 * 60 * 1000).toISOString();
+
+    // Delete older OTPs for this email to avoid confusion
+    try {
+      db.prepare('DELETE FROM password_resets WHERE LOWER(email) = ?').run(cleanEmail);
+    } catch (_) {}
+
+    // Store OTP in database
+    db.prepare(`
+      INSERT INTO password_resets (email, otp, expires_at)
+      VALUES (?, ?, ?)
+    `).run(cleanEmail, otp, expiresAt);
+
+    // Send email
+    await sendOtpEmail(cleanEmail, otp, user.display_name || user.username);
+
+    res.json({
+      success: true,
+      message: `Kode verifikasi OTP 6 digit telah dikirim ke ${cleanEmail}. Silakan periksa kotak masuk atau spam email Anda.`,
+      debugOtp: process.env.NODE_ENV !== 'production' ? otp : undefined
+    });
+  } catch (error) {
+    console.error('Forgot password error:', error);
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// POST /api/auth/reset-password (Verify OTP and Set New Password)
+router.post('/reset-password', (req, res) => {
+  try {
+    const { email = '', otp = '', newPassword = '' } = req.body;
+    const cleanEmail = String(email || '').trim().toLowerCase();
+    const cleanOtp = String(otp || '').trim();
+
+    if (!cleanEmail || !cleanOtp || !newPassword) {
+      return res.status(400).json({ success: false, message: 'Email, kode OTP, dan kata sandi baru wajib diisi.' });
+    }
+
+    if (newPassword.length < 4) {
+      return res.status(400).json({ success: false, message: 'Kata sandi baru minimal 4 karakter.' });
+    }
+
+    // Verify OTP record
+    const resetRecord = db.prepare(`
+      SELECT * FROM password_resets 
+      WHERE LOWER(email) = ? AND otp = ?
+      ORDER BY id DESC LIMIT 1
+    `).get(cleanEmail, cleanOtp);
+
+    if (!resetRecord) {
+      return res.status(400).json({
+        success: false,
+        message: 'Kode OTP salah atau tidak sesuai. Periksa kembali kode pada email Anda.'
+      });
+    }
+
+    // Check expiration
+    if (new Date(resetRecord.expires_at) < new Date()) {
+      return res.status(400).json({
+        success: false,
+        message: 'Kode OTP telah kedaluwarsa (masa berlaku 15 menit habis). Silakan minta kode baru.'
+      });
+    }
+
+    // Update password in users table
+    const salt = crypto.randomBytes(16).toString('hex');
+    const passwordHash = hashPassword(newPassword, salt);
+
+    const updateResult = db.prepare(`
+      UPDATE users 
+      SET password_hash = ?, salt = ? 
+      WHERE (email IS NOT NULL AND LOWER(email) = ?) 
+         OR LOWER(username) = ?
+    `).run(passwordHash, salt, cleanEmail, cleanEmail);
+
+    if (updateResult.changes === 0) {
+      return res.status(404).json({ success: false, message: 'Akun dengan email tersebut tidak ditemukan.' });
+    }
+
+    // Invalidate used OTP
+    try {
+      db.prepare('DELETE FROM password_resets WHERE LOWER(email) = ?').run(cleanEmail);
+    } catch (_) {}
+
+    res.json({
+      success: true,
+      message: 'Kata sandi berhasil diperbarui! Silakan masuk dengan kata sandi baru Anda.'
+    });
+  } catch (error) {
+    console.error('Reset password error:', error);
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
 // GET /api/auth/me
 router.get('/me', (req, res) => {
   try {
-    const username = (req.headers['x-user-id'] || req.query.userId || '').toString().trim().toLowerCase();
-    if (!username) {
+    const identifier = (req.headers['x-user-id'] || req.query.userId || '').toString().trim().toLowerCase();
+    if (!identifier) {
       return res.json({ success: true, user: null });
     }
 
-    const user = db.prepare('SELECT id, username, display_name, avatar, created_at FROM users WHERE LOWER(username) = ?').get(username);
+    const user = db.prepare(`
+      SELECT id, username, email, display_name, avatar, created_at 
+      FROM users 
+      WHERE (email IS NOT NULL AND LOWER(email) = ?) OR LOWER(username) = ?
+    `).get(identifier, identifier);
+
     if (!user) {
       return res.json({ success: true, user: null });
     }
 
-    // Also get counts of bookmarks & history
     const bmCount = db.prepare('SELECT COUNT(*) as count FROM bookmarks WHERE user_id = ?').get(user.username)?.count || 0;
     const histCount = db.prepare('SELECT COUNT(*) as count FROM watch_history WHERE user_id = ?').get(user.username)?.count || 0;
 
@@ -194,6 +352,7 @@ router.get('/me', (req, res) => {
       user: {
         id: user.id,
         username: user.username,
+        email: user.email,
         displayName: user.display_name,
         avatar: user.avatar,
         createdAt: user.created_at,
@@ -210,7 +369,7 @@ router.get('/me', (req, res) => {
 router.get('/users', (req, res) => {
   try {
     const users = db.prepare(`
-      SELECT id, username, display_name as displayName, avatar
+      SELECT id, username, email, display_name as displayName, avatar
       FROM users
       ORDER BY id DESC
       LIMIT 10

@@ -127,12 +127,21 @@ try {
       value TEXT,
       updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
     );
+
+    CREATE TABLE IF NOT EXISTS password_resets (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      email TEXT NOT NULL,
+      otp TEXT NOT NULL,
+      expires_at DATETIME NOT NULL,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
   `);
 } catch (err) {
   console.warn('Database table setup skipped/warning:', err.message);
 }
 
 // Safe migrations for existing SQLite databases
+try { db.exec("ALTER TABLE users ADD COLUMN email TEXT"); } catch (_) {}
 try { db.exec("ALTER TABLE bookmarks ADD COLUMN type TEXT DEFAULT 'anime'"); } catch (_) {}
 try { db.exec("ALTER TABLE watch_history ADD COLUMN type TEXT DEFAULT 'anime'"); } catch (_) {}
 try { db.exec("ALTER TABLE watch_history ADD COLUMN resume_route TEXT"); } catch (_) {}
