@@ -65,12 +65,30 @@ app.get(['/AnimeIn-TV-Release.apk', '/animein-tv.apk', '/downloads/animein-tv.ap
   res.download(tvReleaseApk, 'AnimeIn-TV-Release.apk');
 });
 
-// Serve compiled React frontend
-app.use(express.static(distPath));
+// Serve compiled React frontend with immutable caching for versioned assets
+app.use('/assets', express.static(path.join(distPath, 'assets'), {
+  maxAge: '1y',
+  immutable: true
+}));
+app.use(express.static(distPath, {
+  setHeaders: (res, filePath) => {
+    if (filePath.endsWith('index.html')) {
+      res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+      res.setHeader('Pragma', 'no-cache');
+      res.setHeader('Expires', '0');
+    }
+  }
+}));
 
-// SPA fallback for React Router DOM
+// SPA fallback for React Router DOM - never return HTML for missing static files
 app.get('*', (req, res, next) => {
   if (req.path.startsWith('/api')) return next();
+  if (req.path.startsWith('/assets/') || /\.(js|css|map|json|woff2?|png|jpe?g|webp|svg|ico)$/i.test(req.path)) {
+    return res.status(404).send('Asset not found');
+  }
+  res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+  res.setHeader('Pragma', 'no-cache');
+  res.setHeader('Expires', '0');
   res.sendFile(path.join(distPath, 'index.html'));
 });
 

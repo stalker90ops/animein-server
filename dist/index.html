@@ -1,18 +1,66 @@
 <!doctype html>
-<html lang="id" class="dark">
+<html lang="id" class="dark" style="background-color: #0B0F19; color-scheme: dark;">
   <head>
     <meta charset="UTF-8" />
     <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='%233B82F6'><polygon points='5 3 19 12 5 21 5 3'/></svg>" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-    <meta name="theme-color" content="#141414" />
+    <meta name="theme-color" content="#0B0F19" />
     <title>AnimeIn - Nonton Anime Subtitle Indonesia</title>
+
+    <!-- Self-healing Cache & Stale Bundle Recovery Script -->
+    <script>
+      (function() {
+        window.addEventListener('error', function(e) {
+          var msg = (e && e.message) ? e.message : '';
+          var isChunkError = /Failed to fetch dynamically imported module|Loading chunk|Unexpected token '<'|Cannot find module/i.test(msg);
+          if (isChunkError) {
+            console.warn('[AnimeIn] Stale bundle mismatch detected. Auto-reloading clean cache...', msg);
+            var key = '__animein_last_recovery__';
+            var last = sessionStorage.getItem(key);
+            var now = Date.now();
+            if (!last || (now - parseInt(last, 10)) > 6000) {
+              sessionStorage.setItem(key, String(now));
+              window.location.reload(true);
+            }
+          }
+        }, true);
+      })();
+    </script>
+
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
-    <script type="module" crossorigin src="/assets/index-C2fakGTj.js"></script>
-    <link rel="stylesheet" crossorigin href="/assets/index-DmUXrlYx.css">
+    <script type="module" crossorigin src="/assets/index-YrcAwGFf.js"></script>
+    <link rel="stylesheet" crossorigin href="/assets/index-DKPYrHni.css">
   </head>
-  <body class="bg-[#0B0F19] text-gray-100 min-h-screen selection:bg-blue-600 selection:text-white font-['Plus_Jakarta_Sans',sans-serif]">
-    <div id="root"></div>
+  <body class="bg-[#0B0F19] text-gray-100 min-h-screen selection:bg-blue-600 selection:text-white font-['Plus_Jakarta_Sans',sans-serif]" style="background-color: #0B0F19; margin: 0; padding: 0; min-height: 100vh;">
+    <div id="root" style="min-height: 100vh; background-color: #0B0F19;">
+      <!-- Dark Pre-loader rendered instantly before JS executes -->
+      <div id="animein-preloader" style="min-height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; background-color: #0B0F19; color: #FFFFFF; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; text-align: center; padding: 24px;">
+        <div style="display: flex; align-items: center; gap: 12px; margin-bottom: 24px;">
+          <div style="width: 48px; height: 48px; border-radius: 14px; background: linear-gradient(135deg, #2563EB, #4F46E5); display: flex; align-items: center; justify-content: center; box-shadow: 0 10px 25px rgba(37, 99, 235, 0.4);">
+            <svg style="width: 24px; height: 24px; fill: white; margin-left: 2px;" viewBox="0 0 24 24"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+          </div>
+          <span style="font-size: 28px; font-weight: 800; letter-spacing: -0.5px;">Anime<span style="color: #3B82F6;">In</span></span>
+        </div>
+        <p style="margin-top: 4px; font-size: 13px; color: #94A3B8; font-weight: 500;">Memuat konten AnimeIn...</p>
+        
+        <!-- Emergency reload button if user has aggressive browser cache -->
+        <div id="pre-fallback" style="display: none; margin-top: 24px; padding: 16px 20px; background: #131A2A; border: 1px solid #1E293B; border-radius: 16px; max-width: 340px; box-shadow: 0 10px 30px rgba(0,0,0,0.5);">
+          <p style="font-size: 12px; color: #CBD5E1; margin: 0 0 12px 0; line-height: 1.5;">Halaman belum termuat sempurna karena data lama tersimpan di browser Anda.</p>
+          <button onclick="localStorage.removeItem('animein_user'); sessionStorage.clear(); window.location.reload(true);" style="background: #2563EB; color: white; border: none; padding: 8px 18px; border-radius: 10px; font-size: 12px; font-weight: 700; cursor: pointer;">
+            Segarkan & Bersihkan Cache
+          </button>
+        </div>
+        <script>
+          setTimeout(function() {
+            var fb = document.getElementById('pre-fallback');
+            if (fb && document.getElementById('animein-preloader')) {
+              fb.style.display = 'block';
+            }
+          }, 3500);
+        </script>
+      </div>
+    </div>
   </body>
 </html>
