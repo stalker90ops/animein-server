@@ -10,6 +10,7 @@ import syncRoutes from './routes/syncRoutes.js';
 import movieRoutes from './routes/movieRoutes.js';
 import seriesRoutes from './routes/seriesRoutes.js';
 import authRoutes from './routes/authRoutes.js';
+import dubbindoRoutes from './routes/dubbindoRoutes.js';
 
 import fs from 'node:fs';
 
@@ -37,6 +38,7 @@ app.use('/api/sync', syncRoutes);
 app.use('/api/movies', movieRoutes);
 app.use('/api/series', seriesRoutes);
 app.use('/api/auth', authRoutes);
+app.use('/api/dubbindo', dubbindoRoutes);
 
 // Health check
 app.get('/api/health', (req, res) => {
