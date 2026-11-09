@@ -268,7 +268,7 @@ router.get('/', async (req, res) => {
       (status && status !== 'All') ||
       (type && type !== 'All') ||
       (year && year !== 'All') ||
-      (req.query.sort && req.query.sort !== 'default') ||
+      (req.query.sort && req.query.sort !== 'default' && req.query.sort !== 'latest') ||
       Number(page) > 0
     );
 
@@ -397,7 +397,8 @@ router.get('/', async (req, res) => {
         const cached = ratingsMap[m.title];
         const malScore = computeAnimeScore(m, cached);
         const airedYear = m.aired_start ? String(m.aired_start).slice(0, 4) : '';
-        const itemYear = m.year ? String(m.year) : (airedYear || '2025');
+        const rawYear = m.year && /^\d{4}$/.test(String(m.year)) ? String(m.year) : '';
+        const itemYear = rawYear || (/^\d{4}$/.test(airedYear) ? airedYear : '2025');
         return {
           id: m.id,
           title: m.title,
@@ -491,7 +492,8 @@ router.get('/', async (req, res) => {
       const cached = ratingsMap[m.title];
       const malScore = computeAnimeScore(m, cached);
       const airedYear = m.aired_start ? String(m.aired_start).slice(0, 4) : '';
-      const itemYear = m.year ? String(m.year) : (airedYear || '2025');
+      const rawYear = m.year && /^\d{4}$/.test(String(m.year)) ? String(m.year) : '';
+      const itemYear = rawYear || (/^\d{4}$/.test(airedYear) ? airedYear : '2025');
       return {
         id: m.id,
         title: m.title,
@@ -545,40 +547,54 @@ router.get('/featured', async (req, res) => {
   try {
     const home = await getHomeData();
     const hotList = home.hot || [];
-    const sliderData = (home.slider || []).map(s => {
-      const match = hotList.find(h => s.link && s.link.includes(h.id)) || hotList[0];
-      return {
-        id: match ? match.id : s.id,
-        title: match ? match.title : 'Anime Populer',
-        synopsis: match ? match.synopsis : 'Tonton anime terbaru dengan subtitle Indonesia langsung di AnimeIn.',
-        poster: formatImageUrl(s.image),
-        banner: formatImageUrl(s.image),
-        status: match ? (match.status === 'FINISHED' ? 'Completed' : 'Ongoing') : 'Ongoing',
-        score: 8.9,
-        genres: match?.genre || 'Action, Fantasy'
-      };
-    });
-
-    if (sliderData.length > 0) {
-      return res.json({ success: true, data: sliderData });
+    const newList = home.new || [];
+    const combined = [...hotList, ...newList];
+    const seen = new Set();
+    const uniqueFeatured = [];
+    for (const m of combined) {
+      if (m && m.id && !seen.has(m.id)) {
+        seen.add(m.id);
+        uniqueFeatured.push(m);
+      }
+      if (uniqueFeatured.length >= 6) break;
     }
 
-    const featuredHot = hotList.slice(0, 5).map(m => ({
-      id: m.id,
-      title: m.title,
-      synopsis: m.synopsis,
-      poster: formatImageUrl(m.image_poster),
-      banner: formatImageUrl(m.image_cover) || formatImageUrl(m.image_poster),
-      status: m.status === 'FINISHED' ? 'Completed' : 'Ongoing',
-      score: 8.9,
-      genres: m.genre
-    }));
+    if (uniqueFeatured.length > 0) {
+      const featuredData = uniqueFeatured.map(m => ({
+        id: m.id,
+        title: m.title,
+        synopsis: m.synopsis || 'Tonton anime terbaru dengan subtitle Indonesia langsung di AnimeIn.',
+        poster: formatImageUrl(m.image_poster),
+        banner: formatImageUrl(m.image_cover) || formatImageUrl(m.image_poster),
+        status: m.status === 'FINISHED' ? 'Completed' : 'Ongoing',
+        score: computeAnimeScore(m, null) || 8.8,
+        genres: m.genre || 'Action, Fantasy'
+      }));
+      return res.json({ success: true, data: featuredData });
+    }
 
-    res.json({ success: true, data: featuredHot });
+    const local = db.prepare('SELECT * FROM anime ORDER BY score DESC LIMIT 5').all();
+    res.json({
+      success: true,
+      data: local.map(m => ({
+        ...m,
+        poster: formatImageUrl(m.poster),
+        banner: formatImageUrl(m.banner) || formatImageUrl(m.poster),
+        score: m.score || 8.8
+      }))
+    });
   } catch (error) {
     console.error('Error fetching featured:', error.message);
-    const local = db.prepare('SELECT * FROM anime LIMIT 5').all();
-    res.json({ success: true, data: local });
+    const local = db.prepare('SELECT * FROM anime ORDER BY score DESC LIMIT 5').all();
+    res.json({
+      success: true,
+      data: local.map(m => ({
+        ...m,
+        poster: formatImageUrl(m.poster),
+        banner: formatImageUrl(m.banner) || formatImageUrl(m.poster),
+        score: m.score || 8.8
+      }))
+    });
   }
 });
 

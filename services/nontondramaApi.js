@@ -401,6 +401,93 @@ export async function getNontondramaDetail(slug) {
       }
     }
 
+    // Fallback when NontonDrama HTML is blocked by Cloudflare on datacenter IPs (e.g. Vercel)
+    let finalTitle = title;
+    let finalSynopsis = synopsis;
+    let finalPoster = poster;
+    let finalRating = ratingMatch ? ratingMatch[1].trim() : '8.0';
+    let finalYear = yearMatch ? yearMatch[1].trim() : '';
+
+    const isCloudflareBlocked =
+      !finalTitle ||
+      finalTitle.toLowerCase().includes('just a moment') ||
+      finalTitle.toLowerCase().includes('attention required') ||
+      Object.keys(episodesBySeason).length === 0;
+
+    if (isCloudflareBlocked) {
+      const searchWords = slug
+        .replace(/-(19\d\d|20\d\d)$/, '')
+        .replace(/-/g, ' ')
+        .trim();
+
+      let maxSeason = 1;
+      let maxEpisode = 12;
+
+      try {
+        const searchRes = await fetch(`${NONTONDRAMA_SEARCH_API}?s=${encodeURIComponent(searchWords)}`, {
+          headers: {
+            'Origin': NONTONDRAMA_BASE,
+            'Referer': `${NONTONDRAMA_BASE}/`,
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+          },
+          signal: AbortSignal.timeout(8000)
+        });
+        if (searchRes.ok) {
+          const json = await searchRes.json().catch(() => null);
+          const items = json?.data || json?.items || [];
+          const matched =
+            items.find(it => String(it.slug || '').replace(/^\//, '').replace(/\/$/, '') === slug) ||
+            items[0];
+          if (matched) {
+            finalTitle = decodeEntities(matched.title || searchWords);
+            if (matched.poster) {
+              finalPoster = matched.poster.startsWith('http')
+                ? matched.poster
+                : `${NONTONDRAMA_POSTER_BASE}${matched.poster.replace(/^\//, '')}`;
+            }
+            if (matched.rating && Number(matched.rating) > 0) {
+              finalRating = String(matched.rating);
+            }
+            if (matched.year) {
+              finalYear = String(matched.year);
+            }
+            if (matched.season && Number(matched.season) > 0) {
+              maxSeason = Math.min(Number(matched.season), 10);
+            }
+            if (matched.episode && Number(matched.episode) > 0) {
+              maxEpisode = Math.min(Number(matched.episode), 50);
+            }
+          }
+        }
+      } catch (e) {
+        // ignore search fallback error
+      }
+
+      if (!finalTitle || finalTitle.toLowerCase().includes('just a moment')) {
+        finalTitle = searchWords.replace(/\b\w/g, c => c.toUpperCase());
+      }
+
+      if (!finalSynopsis) {
+        finalSynopsis = `Tonton serial drama ${finalTitle}${finalYear ? ` (${finalYear})` : ''} subtitle Indonesia lengkap semua season dan episode.`;
+      }
+
+      if (Object.keys(episodesBySeason).length === 0) {
+        for (let s = 1; s <= maxSeason; s++) {
+          const sKey = String(s);
+          episodesBySeason[sKey] = [];
+          const epCount = s === maxSeason ? maxEpisode : 10;
+          for (let ep = 1; ep <= epCount; ep++) {
+            episodesBySeason[sKey].push({
+              s,
+              episode_no: ep,
+              title: `Season ${s} Episode ${ep}`,
+              slug: `${slug}-season-${s}-episode-${ep}`
+            });
+          }
+        }
+      }
+    }
+
     // Count total episodes
     let totalEpisodesCount = 0;
     for (const eps of Object.values(episodesBySeason)) {
@@ -412,13 +499,13 @@ export async function getNontondramaDetail(slug) {
       source: 'nontondrama',
       type: 'series',
       slug,
-      title,
-      synopsis,
-      poster,
-      banner: poster,
+      title: finalTitle,
+      synopsis: finalSynopsis,
+      poster: finalPoster,
+      banner: finalPoster,
       genres,
-      rating: ratingMatch ? ratingMatch[1].trim() : '8.0',
-      year: yearMatch ? yearMatch[1].trim() : '',
+      rating: finalRating,
+      year: finalYear,
       totalSeasons: Object.keys(episodesBySeason).length,
       totalEpisodes: totalEpisodesCount,
       seasons: episodesBySeason,
@@ -455,7 +542,8 @@ export async function getNontondramaEpisode(episodeSlug) {
           name: isP2P ? 'Server Direct HD (P2P)' : `Server ${sm[3].toUpperCase()}`,
           serverType,
           embedUrl,
-          directStreamUrl: `/api/movies/lk21/stream.m3u8?embedUrl=${encodeURIComponent(embedUrl)}`
+          directStreamUrl: isP2P ? `/api/movies/lk21/stream.m3u8?embedUrl=${encodeURIComponent(embedUrl)}` : null,
+          embedProxyUrl: `/api/movies/lk21/embed-frame?url=${encodeURIComponent(embedUrl)}`
         });
       }
     }
@@ -467,8 +555,71 @@ export async function getNontondramaEpisode(episodeSlug) {
       return 0;
     });
 
+    if (servers.length === 0 || title.toLowerCase().includes('just a moment')) {
+      const epMatch = episodeSlug.match(/^(.*?)-season-(\d+)-episode-(\d+)/i);
+      const seriesSlug = epMatch ? epMatch[1] : episodeSlug;
+      const seasonNum = epMatch ? parseInt(epMatch[2], 10) || 1 : 1;
+      const epNum = epMatch ? parseInt(epMatch[3], 10) || 1 : 1;
+
+      const yearInSlug = (seriesSlug.match(/-(19\d\d|20\d\d)$/) || [])[1] || '';
+      const cleanSeriesName = seriesSlug
+        .replace(/-(19\d\d|20\d\d)$/, '')
+        .replace(/-/g, ' ')
+        .trim();
+
+      title = `${cleanSeriesName.replace(/\b\w/g, c => c.toUpperCase())} - Season ${seasonNum} Episode ${epNum}`;
+
+      let imdbId = '';
+      try {
+        const imdbQuery = `${cleanSeriesName} ${yearInSlug}`.trim().toLowerCase();
+        const firstChar = (imdbQuery[0] || 'a').replace(/[^a-z0-9]/, 'a');
+        const imdbRes = await fetch(
+          `https://v3.sg.media-imdb.com/suggestion/${firstChar}/${encodeURIComponent(imdbQuery)}.json`,
+          { signal: AbortSignal.timeout(6000) }
+        );
+        if (imdbRes.ok) {
+          const imdbJson = await imdbRes.json().catch(() => null);
+          const candidates = (imdbJson?.d || []).filter(item => item.id && item.id.startsWith('tt'));
+          const best =
+            candidates.find(item => item.qid === 'tvSeries' || item.qid === 'tvMiniSeries') ||
+            candidates[0];
+          if (best) {
+            imdbId = best.id;
+          }
+        }
+      } catch (e) {
+        // ignore IMDb error
+      }
+
+      if (imdbId) {
+        servers.push(
+          {
+            name: 'Server VidSrc HD (Auto Sub)',
+            serverType: 'vidsrc',
+            embedUrl: `https://vidsrc.cc/v2/embed/tv/${imdbId}/${seasonNum}/${epNum}`,
+            directStreamUrl: null,
+            embedProxyUrl: `https://vidsrc.cc/v2/embed/tv/${imdbId}/${seasonNum}/${epNum}`
+          },
+          {
+            name: 'Server VidSrc Pro (Sub Indo)',
+            serverType: 'vidsrc_xyz',
+            embedUrl: `https://vidsrc.xyz/embed/tv?imdb=${imdbId}&season=${seasonNum}&episode=${epNum}&ds_lang=id`,
+            directStreamUrl: null,
+            embedProxyUrl: `https://vidsrc.xyz/embed/tv?imdb=${imdbId}&season=${seasonNum}&episode=${epNum}&ds_lang=id`
+          },
+          {
+            name: 'Server MultiEmbed VIP',
+            serverType: 'multiembed',
+            embedUrl: `https://multiembed.mov/?video_id=${imdbId}&s=${seasonNum}&e=${epNum}`,
+            directStreamUrl: null,
+            embedProxyUrl: `https://multiembed.mov/?video_id=${imdbId}&s=${seasonNum}&e=${epNum}`
+          }
+        );
+      }
+    }
+
     const primary = servers[0];
-    const streamUrl = primary ? primary.directStreamUrl : '';
+    const streamUrl = primary ? (primary.directStreamUrl || '') : '';
 
     return {
       slug: episodeSlug,

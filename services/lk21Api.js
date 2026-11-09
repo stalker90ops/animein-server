@@ -532,27 +532,168 @@ export async function getLk21MovieDetail(slug) {
       return 0;
     });
 
+    // Fallback when LK21 HTML is blocked by Cloudflare on datacenter IPs (e.g. Vercel)
+    let finalTitle = title;
+    let finalSynopsis = synopsis;
+    let finalPoster = poster;
+    let finalRating = rating;
+    let finalYear = year;
+    let finalQuality = rawQuality;
+    let finalDuration = duration;
+    let finalCast = cast;
+
+    const isCloudflareBlocked =
+      !finalTitle ||
+      finalTitle.toLowerCase().includes('just a moment') ||
+      finalTitle.toLowerCase().includes('attention required') ||
+      servers.length === 0;
+
+    if (isCloudflareBlocked) {
+      const searchWords = slug
+        .replace(/-(19\d\d|20\d\d)$/, '')
+        .replace(/-/g, ' ')
+        .trim();
+
+      try {
+        const searchRes = await fetch(`${LK21_SEARCH_API}?s=${encodeURIComponent(searchWords)}`, {
+          headers: {
+            'Origin': LK21_BASE,
+            'Referer': `${LK21_BASE}/`,
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+          },
+          signal: AbortSignal.timeout(8000)
+        });
+        if (searchRes.ok) {
+          const json = await searchRes.json().catch(() => null);
+          const items = json?.data || json?.items || [];
+          const matched =
+            items.find(it => String(it.slug || '').replace(/^\//, '').replace(/\/$/, '') === slug) ||
+            items[0];
+          if (matched) {
+            finalTitle = decodeEntities(matched.title || searchWords);
+            if (matched.poster) {
+              finalPoster = matched.poster.startsWith('http')
+                ? matched.poster
+                : `${LK21_POSTER_BASE}${matched.poster.replace(/^\//, '')}`;
+            }
+            if (matched.rating && Number(matched.rating) > 0) {
+              finalRating = String(matched.rating);
+            }
+            if (matched.year) {
+              finalYear = String(matched.year);
+            }
+            if (matched.quality) {
+              finalQuality = String(matched.quality).toUpperCase();
+            }
+            if (matched.runtime) {
+              finalDuration = String(matched.runtime);
+            }
+          }
+        }
+      } catch (e) {
+        // ignore search fallback error
+      }
+
+      if (!finalTitle || finalTitle.toLowerCase().includes('just a moment')) {
+        finalTitle = searchWords.replace(/\b\w/g, c => c.toUpperCase());
+      }
+
+      const cleanMovieName = finalTitle.replace(/\(\d{4}\)/g, '').trim();
+      let imdbId = '';
+      try {
+        const imdbQuery = `${cleanMovieName} ${finalYear}`.trim().toLowerCase();
+        const firstChar = (imdbQuery[0] || 'a').replace(/[^a-z0-9]/, 'a');
+        const imdbRes = await fetch(
+          `https://v3.sg.media-imdb.com/suggestion/${firstChar}/${encodeURIComponent(imdbQuery)}.json`,
+          { signal: AbortSignal.timeout(6000) }
+        );
+        if (imdbRes.ok) {
+          const imdbJson = await imdbRes.json().catch(() => null);
+          const candidates = (imdbJson?.d || []).filter(item => item.id && item.id.startsWith('tt'));
+          const best =
+            candidates.find(item => !finalYear || String(item.y) === String(finalYear)) ||
+            candidates[0];
+          if (best) {
+            imdbId = best.id;
+            if (!finalCast && best.s) finalCast = best.s;
+            if (!finalPoster && best.i?.imageUrl) finalPoster = best.i.imageUrl;
+            if (!finalYear && best.y) finalYear = String(best.y);
+          }
+        }
+      } catch (e) {
+        // ignore IMDb lookup error
+      }
+
+      if (!finalSynopsis) {
+        finalSynopsis = `Tonton film ${finalTitle}${finalYear ? ` (${finalYear})` : ''} kualitas ${finalQuality} dengan subtitle Indonesia.${finalCast ? ` Dibintangi oleh ${finalCast}.` : ''}`;
+      }
+
+      if (servers.length === 0) {
+        if (imdbId) {
+          servers.push(
+            {
+              name: 'Server VidSrc HD (Auto Sub)',
+              serverType: 'vidsrc',
+              embedUrl: `https://vidsrc.cc/v2/embed/movie/${imdbId}`,
+              directStreamUrl: null,
+              embedProxyUrl: `https://vidsrc.cc/v2/embed/movie/${imdbId}`
+            },
+            {
+              name: 'Server VidSrc Pro (Sub Indo)',
+              serverType: 'vidsrc_xyz',
+              embedUrl: `https://vidsrc.xyz/embed/movie?imdb=${imdbId}&ds_lang=id`,
+              directStreamUrl: null,
+              embedProxyUrl: `https://vidsrc.xyz/embed/movie?imdb=${imdbId}&ds_lang=id`
+            },
+            {
+              name: 'Server MultiEmbed VIP',
+              serverType: 'multiembed',
+              embedUrl: `https://multiembed.mov/?video_id=${imdbId}`,
+              directStreamUrl: null,
+              embedProxyUrl: `https://multiembed.mov/?video_id=${imdbId}`
+            },
+            {
+              name: 'Server AutoEmbed HD',
+              serverType: 'autoembed',
+              embedUrl: `https://player.autoembed.cc/embed/movie/${imdbId}`,
+              directStreamUrl: null,
+              embedProxyUrl: `https://player.autoembed.cc/embed/movie/${imdbId}`
+            }
+          );
+        } else {
+          const fallbackEmbed = `https://vidsrc.xyz/embed/movie?imdb=${encodeURIComponent(cleanMovieName)}`;
+          servers.push({
+            name: 'Server Global Stream HD',
+            serverType: 'embed',
+            embedUrl: fallbackEmbed,
+            directStreamUrl: null,
+            embedProxyUrl: fallbackEmbed
+          });
+        }
+      }
+    }
+
     // Primary stream URL for immediate direct playback
     const primaryServer = servers[0];
-    const streamUrl = primaryServer ? primaryServer.directStreamUrl : '';
+    const streamUrl = primaryServer ? (primaryServer.directStreamUrl || '') : '';
 
     return {
       id: `lk21_${slug}`,
       source: 'lk21',
       slug,
-      title,
-      synopsis,
-      poster,
-      banner: poster,
-      rating,
-      year,
+      title: finalTitle,
+      synopsis: finalSynopsis,
+      poster: finalPoster,
+      banner: finalPoster,
+      rating: finalRating,
+      year: finalYear,
       genres,
       country,
-      duration,
+      duration: finalDuration,
       director,
-      cast,
+      cast: finalCast,
       url,
-      quality: rawQuality,
+      quality: finalQuality,
       isTrailer,
       streamUrl,
       servers
