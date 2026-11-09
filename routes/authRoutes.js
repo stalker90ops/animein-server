@@ -322,12 +322,20 @@ router.post('/forgot-password', async (req, res) => {
     `).run(cleanEmail, otp, expiresAt);
 
     // Send email
-    await sendOtpEmail(cleanEmail, otp, user.display_name || user.username);
+    const emailResult = await sendOtpEmail(cleanEmail, otp, user.display_name || user.username);
+
+    if (emailResult.isSimulated) {
+      return res.json({
+        success: true,
+        isSimulated: true,
+        simulatedOtp: otp,
+        message: `Kode OTP verifikasi berhasil dibuat! Karena server email (SMTP) belum dikonfigurasi di dashboard hosting, Anda dapat menggunakan kode OTP berikut: ${otp}`
+      });
+    }
 
     res.json({
       success: true,
-      message: `Kode verifikasi OTP 6 digit telah dikirim ke ${cleanEmail}. Silakan periksa kotak masuk atau spam email Anda.`,
-      debugOtp: process.env.NODE_ENV !== 'production' ? otp : undefined
+      message: `Kode verifikasi OTP 6 digit telah dikirim ke ${cleanEmail}. Silakan periksa kotak masuk atau folder spam email Anda.`
     });
   } catch (error) {
     console.error('Forgot password error:', error);

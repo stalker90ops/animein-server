@@ -62,13 +62,13 @@ export async function sendOtpEmail(toEmail, otp, recipientName = '') {
       });
 
       console.log('✅ Email OTP terkirim via SMTP ke:', cleanEmail, 'MessageId:', info.messageId);
-      return { success: true, messageId: info.messageId };
+      return { success: true, isRealEmail: true, messageId: info.messageId };
     } catch (err) {
-      console.warn('⚠️ Gagal mengirim email via SMTP (OTP tetap tercatat di log):', err.message);
-      return { success: false, error: err.message, fallbackOtp: otp };
+      console.warn('⚠️ Gagal mengirim email via SMTP (menggunakan fallback):', err.message);
+      return { success: true, isSimulated: true, otp, error: err.message };
     }
   }
 
-  // Fallback simulation mode
+  // Fallback simulation mode when SMTP credentials are not configured
   return { success: true, isSimulated: true, otp };
 }
