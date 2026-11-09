@@ -1,5 +1,6 @@
 import express from 'express';
 import https from 'node:https';
+import http2 from 'node:http2';
 import {
   getMovieboxCatalog,
   getMovieboxDetail,
@@ -83,31 +84,41 @@ router.get('/test-stream-direct', (req, res) => {
     const targetUrl = req.query.url;
     if (!targetUrl) return res.status(400).json({ error: 'url missing' });
     const parsed = new URL(targetUrl);
-    const httpsReq = https.get({
-      hostname: parsed.hostname,
-      port: 443,
-      path: parsed.pathname + parsed.search,
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Referer': 'https://themoviebox.xyz/',
-        'Range': req.headers.range || 'bytes=0-100'
-      }
-    }, (upRes) => {
-      let chunks = [];
-      upRes.on('data', c => chunks.push(c));
-      upRes.on('end', () => {
+
+    const client = http2.connect(`https://${parsed.hostname}`);
+    client.on('error', err => {
+      res.json({ protocol: 'http2', error: err.message, code: err.code });
+    });
+
+    const h2Req = client.request({
+      ':path': parsed.pathname + parsed.search,
+      ':method': 'GET',
+      'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      'referer': 'https://themoviebox.xyz/',
+      'range': req.headers.range || 'bytes=0-100'
+    });
+
+    let chunks = [];
+    h2Req.on('response', (headers) => {
+      h2Req.on('data', c => chunks.push(c));
+      h2Req.on('end', () => {
         const buf = Buffer.concat(chunks);
+        client.close();
         res.json({
-          statusCode: upRes.statusCode,
-          headers: upRes.headers,
+          protocol: 'http2',
+          statusCode: headers[':status'],
+          headers,
           length: buf.length,
           hex: buf.slice(0, 16).toString('hex')
         });
       });
     });
-    httpsReq.on('error', err => {
-      res.json({ error: err.message, code: err.code });
+
+    h2Req.on('error', (err) => {
+      client.close();
+      res.json({ protocol: 'http2', error: err.message });
     });
+    h2Req.end();
   } catch (err) {
     res.json({ error: err.message });
   }
