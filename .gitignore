@@ -4,3 +4,8 @@ node_modules/
 Thumbs.db
 public/*.zip
 public/*.exe
+dist/*.zip
+dist/*.exe
+*.apk
+*.zip
+*.exe
