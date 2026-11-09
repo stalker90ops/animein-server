@@ -31,7 +31,8 @@ function toSeriesGenreSlug(g) {
 
 // Helper to execute curl with browser user-agent
 async function curlFetch(url) {
-  const cmd = `curl.exe -s -L --max-time 15 -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" "${url}"`;
+  const curlCmd = process.platform === 'win32' ? 'curl.exe' : 'curl';
+  const cmd = `${curlCmd} -s -L --max-time 15 -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" "${url}"`;
   const { stdout } = await execAsync(cmd, { maxBuffer: 10 * 1024 * 1024 });
   return stdout;
 }

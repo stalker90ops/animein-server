@@ -2,14 +2,21 @@ import { spawn } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+import os from 'node:os';
 import { fileURLToPath } from 'node:url';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-const CACHE_DIR = path.join(__dirname, '../public/cache_images');
+const CACHE_DIR = process.env.VERCEL
+  ? path.join(os.tmpdir(), 'cache_images')
+  : path.join(__dirname, '../public/cache_images');
 
-if (!fs.existsSync(CACHE_DIR)) {
-  fs.mkdirSync(CACHE_DIR, { recursive: true });
+try {
+  if (!fs.existsSync(CACHE_DIR)) {
+    fs.mkdirSync(CACHE_DIR, { recursive: true });
+  }
+} catch (err) {
+  console.warn('Cache dir creation skipped/warning:', err.message);
 }
 
 export function proxyAndCacheImage(url, res) {
@@ -29,7 +36,8 @@ export function proxyAndCacheImage(url, res) {
   }
 
   // 2. Otherwise download using curl to bypass Cloudflare hotlink protection
-  const curl = spawn('curl.exe', [
+  const curlCmd = process.platform === 'win32' ? 'curl.exe' : 'curl';
+  const curl = spawn(curlCmd, [
     '-s',
     '-L',
     '-H', 'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',

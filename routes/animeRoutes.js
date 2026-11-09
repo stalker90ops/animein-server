@@ -61,7 +61,8 @@ router.get('/video-proxy', (req, res) => {
   curlArgs.push(url);
 
   import('node:child_process').then(({ spawn }) => {
-    const curl = spawn('curl.exe', curlArgs);
+    const curlCmd = process.platform === 'win32' ? 'curl.exe' : 'curl';
+    const curl = spawn(curlCmd, curlArgs);
 
     let headerBuffer = Buffer.alloc(0);
     let headersSent = false;
