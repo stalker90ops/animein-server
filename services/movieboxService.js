@@ -8,6 +8,42 @@ const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36
 let catalogCache = null;
 let lastCacheTime = 0;
 const CACHE_TTL_MS = 10 * 60 * 1000; // 10 minutes
+const imdbCache = new Map();
+
+/**
+ * Resolve IMDb ID from movie/series title using IMDb's suggestion API
+ */
+export async function getImdbIdFromTitle(title) {
+  if (!title) return null;
+  const clean = title.replace(/\[.*?\]/g, '').replace(/\(.*?\)/g, '').trim();
+  if (!clean) return null;
+  const cacheKey = clean.toLowerCase();
+  if (imdbCache.has(cacheKey)) {
+    return imdbCache.get(cacheKey);
+  }
+
+  return new Promise((resolve) => {
+    const q = encodeURIComponent(clean);
+    https.get(`https://v3.sg.media-imdb.com/suggestion/x/${q}.json`, {
+      headers: { 'User-Agent': USER_AGENT },
+      timeout: 5000
+    }, (res) => {
+      let b = '';
+      res.on('data', c => b += c);
+      res.on('end', () => {
+        try {
+          const data = JSON.parse(b);
+          const first = (data.d || []).find(item => item.id && item.id.startsWith('tt') && (item.q === 'feature' || item.q === 'TV series' || item.q === 'TV mini series' || item.q === 'movie'));
+          const id = first ? first.id : null;
+          if (id) imdbCache.set(cacheKey, id);
+          resolve(id);
+        } catch {
+          resolve(null);
+        }
+      });
+    }).on('error', () => resolve(null));
+  });
+}
 
 /**
  * Make an HTTPS request to MovieBox API with all required spoofed headers
@@ -403,7 +439,92 @@ export async function getMovieboxStream({ subjectId, detailPath = '', se = 0, ep
     const curEp = curSe === 0 ? 0 : (Number(ep) || 1);
     const embedUrl = `https://mzfi.me/spa/videoPlayPage/movies/${actualDetailPath}?id=${subjectId}&type=/movie/detail&detailSe=${curSe}&detailEp=${curEp}&lang=id`;
 
-    // 1. Request playback streams from MovieBox API
+    // 1. Look up IMDb ID to provide high-speed multi-server embeds (VidSrc, 2Embed, etc.)
+    const movieDetail = await getMovieboxDetail(subjectId, actualDetailPath);
+    const movieTitle = movieDetail?.data?.title || '';
+    const isSeries = movieDetail?.data?.type === 'series';
+    const imdbId = await getImdbIdFromTitle(movieTitle);
+
+    const embedServers = [];
+    if (imdbId) {
+      if (isSeries) {
+        embedServers.push({
+          id: 'vidsrc_sh',
+          name: 'Server 1 (VidSrc HD)',
+          quality: '1080p',
+          resolution: '1080',
+          type: 'embed',
+          isDirect: false,
+          isPrimary: true,
+          isDefault: true,
+          link: `https://vidsrc.sh/embed/tv?imdb=${imdbId}&season=${curSe || 1}&episode=${curEp || 1}`
+        });
+        embedServers.push({
+          id: 'vidsrc_pm',
+          name: 'Server 2 (VidSrc PM)',
+          quality: '1080p',
+          resolution: '1080',
+          type: 'embed',
+          isDirect: false,
+          link: `https://vidsrc.pm/embed/tv?imdb=${imdbId}&season=${curSe || 1}&episode=${curEp || 1}`
+        });
+        embedServers.push({
+          id: 'twoembed',
+          name: 'Server 3 (2Embed HD)',
+          quality: '1080p',
+          resolution: '1080',
+          type: 'embed',
+          isDirect: false,
+          link: `https://www.2embed.cc/embedtv/${imdbId}&s=${curSe || 1}&e=${curEp || 1}`
+        });
+      } else {
+        embedServers.push({
+          id: 'vidsrc_sh',
+          name: 'Server 1 (VidSrc HD)',
+          quality: '1080p',
+          resolution: '1080',
+          type: 'embed',
+          isDirect: false,
+          isPrimary: true,
+          isDefault: true,
+          link: `https://vidsrc.sh/embed/movie?imdb=${imdbId}`
+        });
+        embedServers.push({
+          id: 'vidsrc_pm',
+          name: 'Server 2 (VidSrc PM)',
+          quality: '1080p',
+          resolution: '1080',
+          type: 'embed',
+          isDirect: false,
+          link: `https://vidsrc.pm/embed/movie?imdb=${imdbId}`
+        });
+        embedServers.push({
+          id: 'twoembed',
+          name: 'Server 3 (2Embed HD)',
+          quality: '1080p',
+          resolution: '1080',
+          type: 'embed',
+          isDirect: false,
+          link: `https://www.2embed.cc/embed/${imdbId}`
+        });
+      }
+    }
+
+    // MovieBox Cloud Player
+    embedServers.push({
+      id: `mb_embed_${subjectId}_${curSe}_${curEp}`,
+      name: `Server ${embedServers.length + 1} (MovieBox Cloud)`,
+      quality: '1080p',
+      resolution: '1080',
+      type: 'embed',
+      isDirect: false,
+      isPrimary: embedServers.length === 0,
+      isDefault: embedServers.length === 0,
+      link: embedUrl,
+      format: 'EMBED'
+    });
+
+    // 2. Request playback streams from MovieBox API for direct MP4 and Soft Subtitles
     const playUrl = `/wefeed-h5api-bff/subject/play?subjectId=${subjectId}&se=${curSe}&ep=${curEp}&detailPath=${actualDetailPath}&streamSignType=0`;
     const playRes = await apiRequest(playUrl, {
       headers: {
@@ -415,21 +536,7 @@ export async function getMovieboxStream({ subjectId, detailPath = '', se = 0, ep
     const streams = playRes?.data?.streams || [];
     const hls = playRes?.data?.hls || [];
 
-    // Official Embedded Player (Always works across mobile/desktop/datacenter without CORS or IP block)
-    const embedServer = {
-      id: `mb_embed_${subjectId}_${curSe}_${curEp}`,
-      name: 'Server MovieBox (HD Multi-Sub)',
-      quality: '1080p',
-      resolution: '1080',
-      type: 'embed',
-      isDirect: false,
-      isPrimary: true,
-      isDefault: true,
-      link: embedUrl,
-      format: 'EMBED'
-    };
-
-    // 2. Fetch Soft Subtitles
+    // 3. Fetch Soft Subtitles
     let captions = [];
     const streamIdForCaption = streams.find(s => s.id)?.id || hls[0]?.id;
     if (streamIdForCaption) {
@@ -468,7 +575,7 @@ export async function getMovieboxStream({ subjectId, detailPath = '', se = 0, ep
       })
       .sort((a, b) => parseInt(b.resolution || 0, 10) - parseInt(a.resolution || 0, 10));
 
-    const formattedServers = [embedServer, ...directServers];
+    const formattedServers = [...embedServers, ...directServers];
 
     // 4. Format Soft Subtitles
     const formattedSubtitles = captions.map(c => {
@@ -495,6 +602,7 @@ export async function getMovieboxStream({ subjectId, detailPath = '', se = 0, ep
       detailPath: actualDetailPath,
       season: curSe,
       episode: curEp,
+      imdbId: imdbId || '',
       servers: formattedServers,
       subtitles: formattedSubtitles,
       downloads: streams.map(s => ({
