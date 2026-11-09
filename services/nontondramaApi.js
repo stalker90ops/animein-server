@@ -8,7 +8,10 @@ const execAsync = promisify(exec);
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// In-memory series catalog loaded from offline pre-indexed database
+const NONTONDRAMA_BASE = 'https://tv.nontondrama.vip';
+const NONTONDRAMA_POSTER_BASE = 'https://poster.assetsy.de/wp-content/uploads/';
+
+// In-memory cache for series catalog fallback
 let seriesStreamsCatalog = {};
 try {
   const catalogPath = path.join(__dirname, '..', 'database', 'series_streams_cache.json');
@@ -19,9 +22,9 @@ try {
   console.warn('Could not load series_streams_cache.json:', err.message);
 }
 
-const NONTONDRAMA_BASE = 'https://tv.nontondrama.vip';
-const NONTONDRAMA_SEARCH_API = 'https://gudangvape.com/search.php';
-const NONTONDRAMA_POSTER_BASE = 'https://poster.assetsy.de/wp-content/uploads/';
+// In-memory cache for episode stream responses (TTL: 1 hour)
+const episodeCache = new Map();
+const EPISODE_CACHE_TTL = 60 * 60 * 1000;
 
 // Helper to decode HTML entities in titles
 function decodeEntities(str) {
@@ -45,24 +48,8 @@ function toSeriesGenreSlug(g) {
   return clean.replace(/\s+/g, '-');
 }
 
-// Helper to execute fetch with browser user-agent
+// Helper to execute curl with browser user-agent
 async function curlFetch(url) {
-  try {
-    const res = await fetch(url, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-        'Referer': `${NONTONDRAMA_BASE}/`
-      },
-      signal: AbortSignal.timeout(12000)
-    });
-    if (res.ok) {
-      return await res.text();
-    }
-  } catch (err) {
-    // Fall back to CLI curl if fetch fails
-  }
-
   const curlCmd = process.platform === 'win32' ? 'curl.exe' : 'curl';
   const cmd = `${curlCmd} -s -L --max-time 15 -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" "${url}"`;
   const { stdout } = await execAsync(cmd, { maxBuffer: 10 * 1024 * 1024 });
@@ -88,7 +75,7 @@ function parseSeriesArticles(html) {
                      art.match(/data-src="([^"]+)"/) ||
                      art.match(/src="([^"]+)"/);
     const ratingMatch = art.match(/itemprop="ratingValue">([^<]+)<\/span>/) ||
-                        art.match(/class="rating"[^>]*>[\s\S]*?(\d+(?:\.\d+)?)[\s\S]*?<\/span>/);
+                        art.match(/class="rating"[^>]*>([\s\S]*?)<\/span>/);
     const genreMatch = art.match(/itemprop="genre"\s+content="([^"]+)"/) ||
                        art.match(/class="genre"[^>]*>([^<]+)<\/div>/);
     const yearMatch = art.match(/class="year"[^>]*>([^<]+)<\/span>/);
@@ -114,7 +101,7 @@ function parseSeriesArticles(html) {
         slug,
         title: rawTitle,
         poster: imgMatch ? imgMatch[1] : '',
-        rating: ratingMatch ? ratingMatch[1].trim() : '8.0',
+        rating: ratingMatch ? ratingMatch[1].replace(/<[^>]+>/g, '').trim() : '8.0',
         genres: genreMatch ? genreMatch[1].trim() : 'Drama, Romance',
         year: yearVal,
         episodeBadge: episodeText,
@@ -127,207 +114,184 @@ function parseSeriesArticles(html) {
   return articles;
 }
 
-// 1. Get Series List from Verified Catalog & NontonDrama
+// 1. Get Series List from tv.nontondrama.vip (The original safe and stable method)
 export async function getNontondramaSeries({ category = 'latest', genre = '', genres = '', year = '', page = 1, search = '' } = {}) {
   const p = Math.max(1, parseInt(page) || 1);
-  const pageSize = 24;
-  const genreList = (genres || genre || '')
-    .split(',')
-    .map(g => g.trim())
-    .filter(g => g && g !== 'All');
+  const targetGenre = genres || genre || '';
 
-  // Direct Search Mode
+  let targetUrl = `${NONTONDRAMA_BASE}/latest-series/`;
+
   if (search && search.trim()) {
-    const q = search.trim().toLowerCase();
-    const catalogMatches = Object.values(seriesStreamsCatalog).filter(s => {
-      const matchTitle = (s.title || '').toLowerCase().includes(q);
-      const matchSlug = (s.slug || '').toLowerCase().includes(q);
-      const matchGenre = (s.genres || '').toLowerCase().includes(q);
-      const matchCountry = (s.country || '').toLowerCase().includes(q);
-      const matchYear = !year || String(s.year) === String(year);
-      return (matchTitle || matchSlug || matchGenre || matchCountry) && matchYear;
-    });
-
-    // Also query gudangvape search API for live results
-    let apiMatches = [];
-    try {
-      const searchUrl = `${NONTONDRAMA_SEARCH_API}?s=${encodeURIComponent(search.trim())}&page=${p}`;
-      const res = await fetch(searchUrl, {
-        headers: {
-          'Origin': NONTONDRAMA_BASE,
-          'Referer': `${NONTONDRAMA_BASE}/`,
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        },
-        signal: AbortSignal.timeout(8000)
-      });
-      if (res.ok) {
-        const json = await res.json();
-        const items = json?.data || [];
-        apiMatches = items
-          .filter(it => it.type === 'series' || Number(it.episode) > 0 || Number(it.season) > 0)
-          .map(it => {
-            const slug = String(it.slug || '').replace(/^\//, '').replace(/\/$/, '');
-            const catEntry = seriesStreamsCatalog[slug];
-            const rawTitle = decodeEntities((it.title || slug).replace(/\s*-\s*Series$/i, '').trim());
-            const posterUrl = it.poster
-              ? (it.poster.startsWith('http') ? it.poster : `${NONTONDRAMA_POSTER_BASE}${it.poster.replace(/^\//, '')}`)
-              : (catEntry?.poster || '');
-            return {
-              id: `series_${slug}`,
-              source: 'nontondrama',
-              type: 'series',
-              slug,
-              title: catEntry?.title || rawTitle,
-              poster: posterUrl,
-              rating: it.rating && Number(it.rating) > 0 ? String(it.rating) : (catEntry?.rating || '8.0'),
-              genres: catEntry?.genres || (genreList.length > 0 ? genreList.join(', ') : 'Drama, TV Series'),
-              year: it.year ? String(it.year) : (catEntry?.year || ''),
-              episodeBadge: it.episode ? `EPS${it.episode}` : (catEntry?.totalEpisodes ? `EPS${catEntry.totalEpisodes}` : ''),
-              seasonBadge: it.season ? `S.${it.season}` : '',
-              url: `${NONTONDRAMA_BASE}/${slug}`
-            };
-          });
-      }
-    } catch (e) {
-      console.warn('NontonDrama search API error:', e.message);
+    targetUrl = `${NONTONDRAMA_BASE}/?s=${encodeURIComponent(search.trim())}`;
+    if (p > 1) {
+      targetUrl = `${NONTONDRAMA_BASE}/page/${p}/?s=${encodeURIComponent(search.trim())}`;
     }
-
-    const seen = new Set();
-    const merged = [];
-    for (const m of [...catalogMatches, ...apiMatches]) {
-      if (!seen.has(m.slug)) {
-        seen.add(m.slug);
-        merged.push(m);
-      }
-    }
-    return merged.slice((p - 1) * pageSize, p * pageSize);
+  } else if (targetGenre) {
+    const cleanGenre = toSeriesGenreSlug(targetGenre.split(',')[0]);
+    targetUrl = `${NONTONDRAMA_BASE}/genre/${cleanGenre}/`;
+    if (p > 1) targetUrl += `page/${p}/`;
+  } else if (category === 'top' || category === 'populer' || category === 'rating') {
+    targetUrl = `${NONTONDRAMA_BASE}/top-series-today/`;
+    if (p > 1) targetUrl += `page/${p}/`;
+  } else if (category === 'drakor') {
+    targetUrl = `${NONTONDRAMA_BASE}/maraton-drakor/`;
+    if (p > 1) targetUrl += `page/${p}/`;
+  } else if (category === 'asian') {
+    targetUrl = `${NONTONDRAMA_BASE}/series/asian/`;
+    if (p > 1) targetUrl += `page/${p}/`;
+  } else if (category === 'west') {
+    targetUrl = `${NONTONDRAMA_BASE}/series/west/`;
+    if (p > 1) targetUrl += `page/${p}/`;
+  } else if (category === 'ongoing') {
+    targetUrl = `${NONTONDRAMA_BASE}/series/ongoing/`;
+    if (p > 1) targetUrl += `page/${p}/`;
+  } else if (category === 'complete') {
+    targetUrl = `${NONTONDRAMA_BASE}/series/complete/`;
+    if (p > 1) targetUrl += `page/${p}/`;
+  } else {
+    // latest-series
+    if (p > 1) targetUrl = `${NONTONDRAMA_BASE}/latest-series/page/${p}/`;
   }
 
-  // Browse Catalog Pool (497 pre-indexed series with verified seasons/episodes)
+  try {
+    const html = await curlFetch(targetUrl);
+    let list = parseSeriesArticles(html);
+
+    if (year && /^\d{4}$/.test(String(year))) {
+      list = list.filter(m => !m.year || String(m.year) === String(year) || m.title.includes(String(year)));
+    }
+
+    if (list.length > 0) {
+      return list;
+    }
+  } catch (error) {
+    console.warn(`curlFetch failed for ${targetUrl}:`, error.message);
+  }
+
+  // Safe Catalog Fallback if live scrape was empty
   const allCatalog = Object.values(seriesStreamsCatalog);
   if (allCatalog.length > 0) {
     let pool = [...allCatalog];
-
-    // Filter by Category
     const catLower = (category || 'latest').toLowerCase();
     if (catLower === 'drakor') {
-      pool = pool.filter(s =>
-        s.category === 'drakor' ||
-        (s.country || '').toLowerCase().includes('korea') ||
-        (s.genres || '').toLowerCase().includes('korean') ||
-        (s.title || '').toLowerCase().includes('korea')
-      );
+      pool = pool.filter(s => s.category === 'drakor');
     } else if (catLower === 'asian') {
-      pool = pool.filter(s =>
-        s.category === 'asian' ||
-        (s.country || '').toLowerCase().includes('asia') ||
-        (s.country || '').toLowerCase().includes('china') ||
-        (s.country || '').toLowerCase().includes('japan') ||
-        (s.country || '').toLowerCase().includes('thai')
-      );
+      pool = pool.filter(s => s.category === 'asian');
     } else if (catLower === 'west') {
-      pool = pool.filter(s =>
-        s.category === 'west' ||
-        (s.country || '').toLowerCase().includes('united states') ||
-        (s.country || '').toLowerCase().includes('uk')
-      );
-    } else if (catLower === 'ongoing') {
-      pool = pool.filter(s => s.status === 'Ongoing' || (s.year && Number(s.year) >= 2025));
-    } else if (catLower === 'complete') {
-      pool = pool.filter(s => s.status === 'Completed' || (s.year && Number(s.year) < 2025));
-    } else if (catLower === 'top' || catLower === 'populer' || catLower === 'rating') {
-      pool.sort((a, b) => (parseFloat(b.rating) || 0) - (parseFloat(a.rating) || 0));
-    } else {
-      // Default: Latest series sorted by year descending
-      pool.sort((a, b) => (parseInt(b.year) || 0) - (parseInt(a.year) || 0));
+      pool = pool.filter(s => s.category === 'west');
     }
-
-    // Filter by Genre
-    if (genreList.length > 0) {
-      pool = pool.filter(s => {
-        const itemGenres = (s.genres || '').toLowerCase();
-        return genreList.some(g => itemGenres.includes(g.toLowerCase()));
-      });
-    }
-
-    // Filter by Year
-    if (year && /^\d{4}$/.test(String(year))) {
-      pool = pool.filter(s => String(s.year) === String(year) || s.title.includes(String(year)));
-    }
-
-    const startIndex = (p - 1) * pageSize;
-    const paginated = pool.slice(startIndex, startIndex + pageSize);
-
-    if (paginated.length > 0) {
-      return paginated.map(s => ({
-        id: s.id || `series_${s.slug}`,
-        source: 'nontondrama',
-        type: 'series',
-        slug: s.slug,
-        title: s.title,
-        poster: s.poster,
-        rating: s.rating || '8.0',
-        genres: s.genres || 'Drama, Series',
-        year: s.year || '',
-        episodeBadge: s.totalEpisodes ? `EPS${s.totalEpisodes}` : '',
-        seasonBadge: s.totalSeasons ? `S.${s.totalSeasons}` : '',
-        url: s.url || `${NONTONDRAMA_BASE}/${s.slug}`
-      }));
-    }
+    const startIndex = (p - 1) * 24;
+    return pool.slice(startIndex, startIndex + 24).map(s => ({
+      id: s.id || `series_${s.slug}`,
+      source: 'nontondrama',
+      type: 'series',
+      slug: s.slug,
+      title: s.title,
+      poster: s.poster,
+      rating: s.rating || '8.0',
+      genres: s.genres || 'Drama, Series',
+      year: s.year || '',
+      episodeBadge: s.totalEpisodes ? `EPS${s.totalEpisodes}` : '',
+      seasonBadge: s.totalSeasons ? `S.${s.totalSeasons}` : '',
+      url: s.url || `${NONTONDRAMA_BASE}/${s.slug}`
+    }));
   }
 
-  // Fallback to Live Scraping if catalog empty
-  try {
-    const searchTerms = ['series', '2026', '2025', 'korea'];
-    const term = searchTerms[(p - 1) % searchTerms.length] || 'series';
-    const searchRes = await fetch(`${NONTONDRAMA_SEARCH_API}?s=${term}&page=${p}`, {
-      headers: {
-        'Origin': NONTONDRAMA_BASE,
-        'Referer': `${NONTONDRAMA_BASE}/`,
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-      },
-      signal: AbortSignal.timeout(8000)
-    }).catch(() => null);
-
-    if (searchRes && searchRes.ok) {
-      const json = await searchRes.json().catch(() => null);
-      const items = json?.data || [];
-      return items
-        .filter(item => item.type === 'series' || item.season || item.episode)
-        .map(item => {
-          const slug = String(item.slug || '').replace(/^\//, '').replace(/\/$/, '');
-          const rawTitle = decodeEntities(item.title || slug);
-          const posterUrl = item.poster
-            ? (item.poster.startsWith('http') ? item.poster : `${NONTONDRAMA_POSTER_BASE}${item.poster.replace(/^\//, '')}`)
-            : '';
-          const itemYear = item.year ? String(item.year) : ((rawTitle.match(/\((\d{4})\)/) || [])[1] || '');
-          return {
-            id: `series_${slug}`,
-            source: 'nontondrama',
-            slug,
-            title: rawTitle,
-            poster: posterUrl,
-            rating: item.rating && Number(item.rating) > 0 ? String(item.rating) : '7.8',
-            genres: 'Drama, TV Series',
-            year: itemYear,
-            episodeBadge: item.episode ? `EPS${item.episode}` : '',
-            seasonBadge: item.season ? `S.${item.season}` : '',
-            url: `${NONTONDRAMA_BASE}/${slug}`
-          };
-        });
-    }
-    return [];
-  } catch (error) {
-    console.error(`Error fetching nontondrama series fallback:`, error.message);
-    return [];
-  }
+  return [];
 }
 
-// 2. Get Series Detail & Full Season/Episode Tree
+// 2. Get Series Detail & Full Season/Episode Tree (Original reliable parser)
 export async function getNontondramaDetail(slug) {
   const cleanSlug = (slug || '').replace(/^series_/, '');
+  const url = `${NONTONDRAMA_BASE}/${cleanSlug}`;
 
-  // 1. Check verified offline catalog first for instant response
+  try {
+    const html = await curlFetch(url);
+
+    // Meta / Basic info
+    const titleMatch = html.match(/<h1[^>]*class="entry-title"[^>]*>([^<]+)<\/h1>/) ||
+                       html.match(/<title>([^<]+)<\/title>/);
+    let title = titleMatch ? titleMatch[1].replace(/^Lk21\s*Nonton\s*/i, '').replace(/Sub\s*Indo.*$/i, '').replace(/Series$/i, '').trim() : cleanSlug;
+
+    const synMatch = html.match(/<blockquote[^>]*itemprop="description"[^>]*>([\s\S]*?)<\/blockquote>/i) ||
+                     html.match(/<div[^>]*class="entry-content"[^>]*>([\s\S]*?)<\/div>/i);
+    const synopsis = synMatch ? synMatch[1].replace(/<[^>]+>/g, '').trim() : '';
+
+    const posterMatch = html.match(/class="poster"[^>]*>[\s\S]*?<img[^>]*src="([^"]+)"/i) ||
+                        html.match(/<meta[^>]*property="og:image"[^>]*content="([^"]+)"/i);
+    const poster = posterMatch ? posterMatch[1] : '';
+
+    const ratingMatch = html.match(/itemprop="ratingValue">([^<]+)<\/span>/) ||
+                        html.match(/class="rating"[^>]*>([^<]+)<\/span>/);
+    const yearMatch = html.match(/class="year"[^>]*>([^<]+)<\/span>/);
+
+    // Extract Episodes JSON from embedded script
+    let episodesBySeason = {};
+    const scriptMatches = [...html.matchAll(/<script[^>]*>([\s\S]*?)<\/script>/gi)];
+    for (const s of scriptMatches) {
+      const content = s[1].trim();
+      if (content.includes('"episode_no"')) {
+        try {
+          if (content.startsWith('{') && content.endsWith('}')) {
+            episodesBySeason = JSON.parse(content);
+          } else {
+            const jsonMatch = content.match(/(\{["\d]+:\s*\[[\s\S]*?\]\})/);
+            if (jsonMatch) {
+              episodesBySeason = JSON.parse(jsonMatch[1]);
+            }
+          }
+        } catch (e) {
+          // ignore json parse error
+        }
+      }
+    }
+
+    // Fallback: Parse episode links from HTML if script JSON not found
+    if (Object.keys(episodesBySeason).length === 0) {
+      const epLinks = [...html.matchAll(/<a[^>]*href="(\/[^"]*season-(\d+)-episode-(\d+)[^"]*)"[^>]*>([\s\S]*?)<\/a>/gi)];
+      for (const em of epLinks) {
+        const epSlug = em[1].replace(/^\//, '');
+        const sNum = em[2] || '1';
+        const epNum = parseInt(em[3]) || 1;
+        if (!episodesBySeason[sNum]) episodesBySeason[sNum] = [];
+        if (!episodesBySeason[sNum].some(e => e.slug === epSlug)) {
+          episodesBySeason[sNum].push({
+            s: parseInt(sNum),
+            episode_no: epNum,
+            title: `Season ${sNum} Episode ${epNum}`,
+            slug: epSlug
+          });
+        }
+      }
+    }
+
+    let totalEpisodesCount = 0;
+    for (const eps of Object.values(episodesBySeason)) {
+      totalEpisodesCount += (eps?.length || 0);
+    }
+
+    if (totalEpisodesCount > 0) {
+      return {
+        id: `series_${cleanSlug}`,
+        source: 'nontondrama',
+        type: 'series',
+        slug: cleanSlug,
+        title,
+        synopsis,
+        poster,
+        rating: ratingMatch ? ratingMatch[1].trim() : '8.0',
+        year: yearMatch ? yearMatch[1].trim() : '',
+        totalSeasons: Object.keys(episodesBySeason).length,
+        totalEpisodes: totalEpisodesCount,
+        seasons: episodesBySeason,
+        url
+      };
+    }
+  } catch (error) {
+    console.warn(`getNontondramaDetail curl error for ${cleanSlug}:`, error.message);
+  }
+
+  // Fallback to cache if available
   const cached = seriesStreamsCatalog[cleanSlug];
   if (cached) {
     return {
@@ -339,209 +303,116 @@ export async function getNontondramaDetail(slug) {
     };
   }
 
-  // 2. Fallback to scraping / live search API
-  const url = `${NONTONDRAMA_BASE}/${cleanSlug}`;
+  throw new Error(`Informasi serial ${cleanSlug} tidak ditemukan.`);
+}
+
+// 3. Get Episode Stream Servers (The original safe and direct P2P / CAST / HYDRAX servers)
+export async function getNontondramaEpisode(episodeSlug) {
+  // Check memory cache
+  const cached = episodeCache.get(episodeSlug);
+  if (cached && (Date.now() - cached.timestamp < EPISODE_CACHE_TTL)) {
+    return cached.data;
+  }
+
+  const url = `${NONTONDRAMA_BASE}/${episodeSlug}`;
   try {
-    let finalTitle = cleanSlug.replace(/-/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
-    let finalSynopsis = `Tonton serial drama ${finalTitle} subtitle Indonesia lengkap semua season dan episode.`;
-    let finalPoster = '';
-    let finalRating = '8.0';
-    let finalYear = '';
-    let episodesBySeason = {};
+    const html = await curlFetch(url);
 
-    const searchWords = cleanSlug
-      .replace(/-(19\d\d|20\d\d)$/, '')
-      .replace(/-/g, ' ')
-      .trim();
+    const titleMatch = html.match(/<h1[^>]*class="entry-title"[^>]*>([^<]+)<\/h1>/) ||
+                       html.match(/<title>([^<]+)<\/title>/);
+    let title = titleMatch ? titleMatch[1].replace(/^Lk21\s*Nonton\s*/i, '').replace(/Sub\s*Indo.*$/i, '').trim() : episodeSlug;
 
-    let maxSeason = 1;
-    let maxEpisode = 12;
+    // Player servers list
+    const servers = [];
+    const playerListMatch = html.match(/<ul[^>]*id="player-list"[^>]*>([\s\S]*?)<\/ul>/i);
 
-    try {
-      const searchRes = await fetch(`${NONTONDRAMA_SEARCH_API}?s=${encodeURIComponent(searchWords)}`, {
-        headers: {
-          'Origin': NONTONDRAMA_BASE,
-          'Referer': `${NONTONDRAMA_BASE}/`,
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        },
-        signal: AbortSignal.timeout(8000)
-      });
-      if (searchRes.ok) {
-        const json = await searchRes.json().catch(() => null);
-        const items = json?.data || [];
-        const matched =
-          items.find(it => String(it.slug || '').replace(/^\//, '').replace(/\/$/, '') === cleanSlug) ||
-          items[0];
-        if (matched) {
-          finalTitle = decodeEntities(matched.title || searchWords);
-          if (matched.poster) {
-            finalPoster = matched.poster.startsWith('http')
-              ? matched.poster
-              : `${NONTONDRAMA_POSTER_BASE}${matched.poster.replace(/^\//, '')}`;
-          }
-          if (matched.rating && Number(matched.rating) > 0) {
-            finalRating = String(matched.rating);
-          }
-          if (matched.year) {
-            finalYear = String(matched.year);
-          }
-          if (matched.season && Number(matched.season) > 0) {
-            maxSeason = Math.min(Number(matched.season), 10);
-          }
-          if (matched.episode && Number(matched.episode) > 0) {
-            maxEpisode = Math.min(Number(matched.episode), 50);
-          }
-        }
-      }
-    } catch (e) {
-      // ignore search fallback error
-    }
-
-    for (let s = 1; s <= maxSeason; s++) {
-      const sKey = String(s);
-      episodesBySeason[sKey] = [];
-      const epCount = s === maxSeason ? maxEpisode : 10;
-      for (let ep = 1; ep <= epCount; ep++) {
-        episodesBySeason[sKey].push({
-          s,
-          episode_no: ep,
-          title: `Season ${s} Episode ${ep}`,
-          slug: `${cleanSlug}-season-${s}-episode-${ep}`
+    if (playerListMatch) {
+      const serverRegex = /<a[^>]*data-url="([^"]+)"[^>]*data-server="([^"]+)"[^>]*>([^<]+)<\/a>/gi;
+      let sm;
+      while ((sm = serverRegex.exec(playerListMatch[1])) !== null) {
+        const serverType = sm[2].toLowerCase();
+        const embedUrl = sm[1];
+        const isP2P = serverType === 'p2p';
+        servers.push({
+          name: isP2P ? 'Server Direct HD (P2P)' : `Server ${sm[3].toUpperCase()}`,
+          serverType,
+          embedUrl,
+          directStreamUrl: `/api/movies/lk21/stream.m3u8?embedUrl=${encodeURIComponent(embedUrl)}`,
+          embedProxyUrl: `/api/movies/lk21/embed-frame?url=${encodeURIComponent(embedUrl)}`
         });
       }
     }
 
-    let totalEpisodesCount = 0;
-    for (const eps of Object.values(episodesBySeason)) {
-      totalEpisodesCount += (eps?.length || 0);
+    // Sort servers so Server P2P is first
+    servers.sort((a, b) => {
+      if (a.serverType === 'p2p') return -1;
+      if (b.serverType === 'p2p') return 1;
+      return 0;
+    });
+
+    if (servers.length > 0) {
+      const primary = servers[0];
+      const streamUrl = primary ? primary.directStreamUrl : '';
+
+      const result = {
+        slug: episodeSlug,
+        title,
+        streamUrl,
+        servers
+      };
+
+      episodeCache.set(episodeSlug, {
+        timestamp: Date.now(),
+        data: result
+      });
+
+      return result;
     }
-
-    return {
-      id: `series_${cleanSlug}`,
-      source: 'nontondrama',
-      type: 'series',
-      slug: cleanSlug,
-      title: finalTitle,
-      synopsis: finalSynopsis,
-      poster: finalPoster,
-      banner: finalPoster,
-      genres: 'Drama, TV Series',
-      rating: finalRating,
-      year: finalYear,
-      totalSeasons: Object.keys(episodesBySeason).length,
-      totalEpisodes: totalEpisodesCount,
-      seasons: episodesBySeason,
-      url
-    };
   } catch (error) {
-    console.error(`Error fetching nontondrama series detail (${cleanSlug}):`, error.message);
-    throw error;
+    console.warn(`curlFetch error for episode ${episodeSlug}:`, error.message);
   }
-}
 
-// 3. Get Episode Stream Servers with Verified Multi-Source High Quality Players
-export async function getNontondramaEpisode(episodeSlug) {
-  try {
-    const epMatch = episodeSlug.match(/^(.*?)-season-(\d+)-episode-(\d+)/i);
-    const seriesSlug = epMatch ? epMatch[1] : episodeSlug;
-    const seasonNum = epMatch ? parseInt(epMatch[2], 10) || 1 : 1;
-    const epNum = epMatch ? parseInt(epMatch[3], 10) || 1 : 1;
+  // If live episode page not found, check if series exists in cache and resolve fallback
+  const epMatch = episodeSlug.match(/^(.*?)-season-(\d+)-episode-(\d+)/i);
+  const seriesSlug = epMatch ? epMatch[1] : episodeSlug;
+  const seasonNum = epMatch ? parseInt(epMatch[2], 10) || 1 : 1;
+  const epNum = epMatch ? parseInt(epMatch[3], 10) || 1 : 1;
 
-    const catEntry = seriesStreamsCatalog[seriesSlug];
-    const yearInSlug = (seriesSlug.match(/-(19\d\d|20\d\d)$/) || [])[1] || catEntry?.year || '';
-    const cleanSeriesName = catEntry?.title || seriesSlug
-      .replace(/-(19\d\d|20\d\d)$/, '')
-      .replace(/-/g, ' ')
-      .trim();
+  const catEntry = seriesStreamsCatalog[seriesSlug];
+  const cleanSeriesName = catEntry?.title || seriesSlug.replace(/-(19\d\d|20\d\d)$/, '').replace(/-/g, ' ').trim();
+  const title = `${cleanSeriesName} - Season ${seasonNum} Episode ${epNum}`;
 
-    const title = `${cleanSeriesName} - Season ${seasonNum} Episode ${epNum}`;
-    let imdbId = catEntry?.imdbId || '';
-
-    // If no IMDb ID in cache, resolve quickly using IMDb suggestion API
-    if (!imdbId) {
-      try {
-        const imdbQuery = `${cleanSeriesName} ${yearInSlug}`.trim().toLowerCase();
-        const firstChar = (cleanSeriesName[0] || 'a').toLowerCase().replace(/[^a-z0-9]/, 'a');
-        const imdbRes = await fetch(
-          `https://v3.sg.media-imdb.com/suggestion/${firstChar}/${encodeURIComponent(imdbQuery)}.json`,
-          { signal: AbortSignal.timeout(5000) }
-        );
-        if (imdbRes.ok) {
-          const imdbJson = await imdbRes.json().catch(() => null);
-          const candidates = (imdbJson?.d || []).filter(item => item.id && item.id.startsWith('tt'));
-          const best =
-            candidates.find(item => item.qid === 'tvSeries' || item.qid === 'tvMiniSeries') ||
-            candidates[0];
-          if (best) {
-            imdbId = best.id;
-          }
-        }
-      } catch (e) {
-        // ignore IMDb error
+  let imdbId = catEntry?.imdbId || '';
+  if (!imdbId) {
+    try {
+      const firstChar = (cleanSeriesName[0] || 'a').toLowerCase().replace(/[^a-z0-9]/, 'a');
+      const imdbRes = await fetch(
+        `https://v3.sg.media-imdb.com/suggestion/${firstChar}/${encodeURIComponent(cleanSeriesName)}.json`,
+        { signal: AbortSignal.timeout(4000) }
+      );
+      if (imdbRes.ok) {
+        const imdbJson = await imdbRes.json().catch(() => null);
+        const best = (imdbJson?.d || []).find(item => item.id && item.id.startsWith('tt')) || (imdbJson?.d || [])[0];
+        if (best) imdbId = best.id;
       }
-    }
-
-    const servers = [];
-
-    // Working Embed Providers for TV Series with Indonesian Subtitles and No Frame Blocking
-    if (imdbId) {
-      // 1. VidSrc SH (High speed, clean player, supports auto Sub Indo)
-      servers.push({
-        name: 'Server VidSrc VIP (Sub Indo)',
-        serverType: 'vidsrc_sh',
-        embedUrl: `https://vidsrc.sh/embed/tv?imdb=${imdbId}&season=${seasonNum}&episode=${epNum}&ds_lang=id`,
-        directStreamUrl: null,
-        embedProxyUrl: `https://vidsrc.sh/embed/tv?imdb=${imdbId}&season=${seasonNum}&episode=${epNum}&ds_lang=id`
-      });
-
-      // 2. MultiEmbed VIP (Ultra reliable multi-host player)
-      servers.push({
-        name: 'Server MultiEmbed VIP',
-        serverType: 'multiembed',
-        embedUrl: `https://multiembed.mov/?video_id=${imdbId}&s=${seasonNum}&e=${epNum}`,
-        directStreamUrl: null,
-        embedProxyUrl: `https://multiembed.mov/?video_id=${imdbId}&s=${seasonNum}&e=${epNum}`
-      });
-
-      // 3. 2Embed Pro (Fast HD streaming)
-      servers.push({
-        name: 'Server 2Embed Pro',
-        serverType: '2embed',
-        embedUrl: `https://2embed.cc/embedtv/${imdbId}&s=${seasonNum}&e=${epNum}`,
-        directStreamUrl: null,
-        embedProxyUrl: `https://2embed.cc/embedtv/${imdbId}&s=${seasonNum}&e=${epNum}`
-      });
-
-      // 4. VidSrc Me (Legacy stable provider)
-      servers.push({
-        name: 'Server VidSrc Me',
-        serverType: 'vidsrc_me',
-        embedUrl: `https://vidsrc.me/embed/tv?imdb=${imdbId}&season=${seasonNum}&episode=${epNum}`,
-        directStreamUrl: null,
-        embedProxyUrl: `https://vidsrc.me/embed/tv?imdb=${imdbId}&season=${seasonNum}&episode=${epNum}`
-      });
-    } else {
-      // Fallback search embed when IMDb ID not available
-      servers.push({
-        name: 'Server MultiEmbed Search',
-        serverType: 'multiembed',
-        embedUrl: `https://multiembed.mov/?video_id=${encodeURIComponent(cleanSeriesName)}&s=${seasonNum}&e=${epNum}`,
-        directStreamUrl: null,
-        embedProxyUrl: `https://multiembed.mov/?video_id=${encodeURIComponent(cleanSeriesName)}&s=${seasonNum}&e=${epNum}`
-      });
-    }
-
-    const primary = servers[0];
-    const streamUrl = primary ? (primary.directStreamUrl || '') : '';
-
-    return {
-      slug: episodeSlug,
-      title,
-      streamUrl,
-      servers
-    };
-  } catch (error) {
-    console.error(`Error fetching episode stream (${episodeSlug}):`, error.message);
-    throw error;
+    } catch (_) {}
   }
+
+  const fallbackServers = [];
+  if (imdbId) {
+    fallbackServers.push({
+      name: 'Server Direct VIP (Sub Indo)',
+      serverType: 'vidsrc_sh',
+      embedUrl: `https://vidsrc.sh/embed/tv?imdb=${imdbId}&season=${seasonNum}&episode=${epNum}&ds_lang=id`,
+      directStreamUrl: null,
+      embedProxyUrl: `https://vidsrc.sh/embed/tv?imdb=${imdbId}&season=${seasonNum}&episode=${epNum}&ds_lang=id`
+    });
+  }
+
+  return {
+    slug: episodeSlug,
+    title,
+    streamUrl: fallbackServers[0]?.directStreamUrl || '',
+    servers: fallbackServers
+  };
 }
