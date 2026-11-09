@@ -275,6 +275,74 @@ router.get('/', async (req, res) => {
         return true;
       });
 
+      // Fall back to local SQLite database if remote fetch returned no movies
+      if (movies.length === 0) {
+        try {
+          let sql = 'SELECT * FROM anime WHERE 1=1';
+          const params = [];
+          if (queryKeyword) {
+            sql += ' AND (title LIKE ? OR synopsis LIKE ?)';
+            params.push(`%${queryKeyword}%`, `%${queryKeyword}%`);
+          }
+          if (exploreStatus) {
+            sql += ' AND status = ?';
+            params.push(exploreStatus);
+          }
+          if (type && type !== 'All') {
+            sql += ' AND UPPER(type) = UPPER(?)';
+            params.push(type);
+          }
+          if (year && year !== 'All') {
+            sql += ' AND (year = ? OR title LIKE ?)';
+            params.push(String(year), `%${year}%`);
+          }
+          if (rawGenreNames.length > 0) {
+            for (const g of rawGenreNames) {
+              sql += ' AND genres LIKE ?';
+              params.push(`%${g}%`);
+            }
+          }
+          if (sort === 'score' || sort === 'rating') {
+            sql += ' ORDER BY score DESC';
+          } else if (sort === 'views' || sort === 'popular') {
+            sql += ' ORDER BY CAST(views AS INTEGER) DESC';
+          } else if (sort === 'latest') {
+            sql += ' ORDER BY id DESC';
+          } else {
+            sql += ' ORDER BY id DESC';
+          }
+          sql += ' LIMIT 30 OFFSET ?';
+          params.push((parseInt(page) || 0) * 30);
+
+          const localRows = db.prepare(sql).all(...params);
+          if (localRows.length > 0) {
+            return res.json({
+              success: true,
+              count: localRows.length,
+              page: parseInt(page) || 0,
+              data: localRows.map(m => ({
+                id: m.id,
+                title: m.title,
+                synopsis: m.synopsis,
+                poster: formatImageUrl(m.poster),
+                banner: formatImageUrl(m.banner) || formatImageUrl(m.poster),
+                status: m.status === 'FINISHED' ? 'Completed' : 'Ongoing',
+                type: m.type,
+                year: m.year || '2025',
+                score: m.score || 8.5,
+                mal_score: m.score || 8.5,
+                genres: m.genres,
+                release_day: m.release_day,
+                views: m.views,
+                favorites: m.favorites
+              }))
+            });
+          }
+        } catch (dbErr) {
+          console.warn('SQLite fallback query error:', dbErr.message);
+        }
+      }
+
       cacheAnimeList(movies);
 
       const titles = movies.map(m => m.title);
@@ -509,21 +577,72 @@ router.get('/:id', async (req, res) => {
     const { id } = req.params;
     const { userId = 'guest_user' } = req.query;
 
-    const [detailData, epData] = await Promise.all([
-      getMovieDetail(id),
-      getAllMovieEpisodes(id)
-    ]);
+    let movie = null;
+    let episodes = [];
 
-    const movie = detailData.movie;
-    const episodes = (epData?.episode || []).map(ep => ({
-      id: ep.id,
-      anime_id: ep.id_movie,
-      episode_number: ep.index,
-      title: ep.title,
-      views: ep.views,
-      release_date: ep.key_time,
-      thumbnail: formatImageUrl(ep.image || movie.image_poster)
-    }));
+    try {
+      const [detailData, epData] = await Promise.all([
+        getMovieDetail(id),
+        getAllMovieEpisodes(id)
+      ]);
+      movie = detailData?.movie;
+      episodes = (epData?.episode || []).map(ep => ({
+        id: ep.id,
+        anime_id: ep.id_movie,
+        episode_number: ep.index,
+        title: ep.title,
+        views: ep.views,
+        release_date: ep.key_time,
+        thumbnail: formatImageUrl(ep.image || movie?.image_poster)
+      }));
+    } catch (remoteErr) {
+      console.warn(`Remote anime detail for ${id} failed, checking SQLite fallback:`, remoteErr.message);
+    }
+
+    if (!movie) {
+      try {
+        const local = db.prepare('SELECT * FROM anime WHERE id = ?').get(parseInt(id) || 0);
+        if (local) {
+          movie = {
+            id: local.id,
+            title: local.title,
+            synopsis: local.synopsis,
+            synonyms: local.synonyms,
+            image_poster: local.poster,
+            image_cover: local.banner,
+            status: local.status,
+            type: local.type,
+            year: local.year,
+            genre: local.genres,
+            day: local.release_day,
+            studio: local.studio,
+            views: local.views,
+            favorites: local.favorites
+          };
+        }
+      } catch (_) {}
+    }
+
+    if (!episodes || episodes.length === 0) {
+      try {
+        const localEps = db.prepare('SELECT * FROM episodes WHERE anime_id = ? ORDER BY CAST(episode_number AS REAL) ASC').all(parseInt(id) || 0);
+        if (localEps && localEps.length > 0) {
+          episodes = localEps.map(ep => ({
+            id: ep.id,
+            anime_id: ep.anime_id,
+            episode_number: ep.episode_number,
+            title: ep.title || `Episode ${ep.episode_number}`,
+            views: '1000',
+            release_date: ep.release_date || '',
+            thumbnail: formatImageUrl(ep.thumbnail || movie?.image_poster)
+          }));
+        }
+      } catch (_) {}
+    }
+
+    if (!movie) {
+      return res.status(404).json({ success: false, message: 'Anime tidak ditemukan' });
+    }
 
     // Natural sort: Episode 1, 2, 3 ... 170
     episodes.sort((a, b) => {
@@ -533,7 +652,7 @@ router.get('/:id', async (req, res) => {
     });
 
     // Cache anime and all episodes into SQLite
-    cacheAnimeList([movie]);
+    try { cacheAnimeList([movie]); } catch (_) {}
     try {
       const insertEp = db.prepare(`
         INSERT INTO episodes (id, anime_id, episode_number, title, thumbnail, release_date)
