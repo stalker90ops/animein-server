@@ -303,6 +303,11 @@ router.post('/logout', (req, res) => {
   }
 });
 
+const RESET_SECRET = process.env.RESET_SECRET || 'animein_secret_reset_salt_2026';
+function generateResetToken(email, otp, expiresAt) {
+  return crypto.createHmac('sha256', RESET_SECRET).update(`${email}:${otp}:${expiresAt}`).digest('hex');
+}
+
 // POST /api/auth/forgot-password (Request 6-digit OTP to Email)
 router.post('/forgot-password', async (req, res) => {
   try {
@@ -356,6 +361,9 @@ router.post('/forgot-password', async (req, res) => {
       `).run(cleanEmail, otp, expiresAt);
     }
 
+    // Generate stateless cryptographic HMAC resetToken for cross-lambda resilience
+    const resetToken = generateResetToken(targetEmail, otp, expiresAt);
+
     // Send email
     const emailResult = await sendOtpEmail(targetEmail, otp, user.display_name || user.username);
 
@@ -365,6 +373,8 @@ router.post('/forgot-password', async (req, res) => {
         isSimulated: true,
         simulatedOtp: otp,
         email: targetEmail,
+        resetToken,
+        expiresAt,
         message: `Kode OTP verifikasi berhasil dibuat! Karena server email (SMTP) belum dikonfigurasi di dashboard hosting, Anda dapat menggunakan kode OTP berikut: ${otp}`
       });
     }
@@ -372,6 +382,8 @@ router.post('/forgot-password', async (req, res) => {
     res.json({
       success: true,
       email: targetEmail,
+      resetToken,
+      expiresAt,
       message: `Kode verifikasi OTP 6 digit telah dikirim ke ${targetEmail}. Silakan periksa kotak masuk atau folder spam email Anda.`
     });
   } catch (error) {
@@ -383,7 +395,7 @@ router.post('/forgot-password', async (req, res) => {
 // POST /api/auth/reset-password (Verify OTP and Set New Password)
 router.post('/reset-password', (req, res) => {
   try {
-    const { email = '', otp = '', newPassword = '' } = req.body;
+    const { email = '', otp = '', newPassword = '', resetToken = '', expiresAt = '' } = req.body;
     const cleanEmail = String(email || '').trim().toLowerCase();
     const cleanOtp = String(otp || '').trim();
 
@@ -402,26 +414,44 @@ router.post('/reset-password', (req, res) => {
     }
 
     const userEmail = (user.email || '').toLowerCase();
+    let isValidOtp = false;
 
-    // Verify OTP record
+    // 1. Verify OTP from local database record
     const resetRecord = db.prepare(`
       SELECT * FROM password_resets 
       WHERE (LOWER(email) = ? OR LOWER(email) = ?) AND otp = ?
       ORDER BY id DESC LIMIT 1
     `).get(cleanEmail, userEmail, cleanOtp);
 
-    if (!resetRecord) {
+    if (resetRecord) {
+      if (new Date(resetRecord.expires_at) < new Date()) {
+        return res.status(400).json({
+          success: false,
+          message: 'Kode OTP telah kedaluwarsa (masa berlaku 15 menit habis). Silakan minta kode baru.'
+        });
+      }
+      isValidOtp = true;
+    }
+
+    // 2. Stateless cryptographic HMAC verification fallback (guarantees success across any serverless lambda)
+    if (!isValidOtp && resetToken && expiresAt) {
+      if (new Date(expiresAt) < new Date()) {
+        return res.status(400).json({
+          success: false,
+          message: 'Kode OTP telah kedaluwarsa (masa berlaku 15 menit habis). Silakan minta kode baru.'
+        });
+      }
+      const token1 = generateResetToken(cleanEmail, cleanOtp, expiresAt);
+      const token2 = generateResetToken(userEmail, cleanOtp, expiresAt);
+      if (resetToken === token1 || resetToken === token2) {
+        isValidOtp = true;
+      }
+    }
+
+    if (!isValidOtp) {
       return res.status(400).json({
         success: false,
         message: 'Kode OTP salah atau tidak sesuai. Periksa kembali kode pada email Anda.'
-      });
-    }
-
-    // Check expiration
-    if (new Date(resetRecord.expires_at) < new Date()) {
-      return res.status(400).json({
-        success: false,
-        message: 'Kode OTP telah kedaluwarsa (masa berlaku 15 menit habis). Silakan minta kode baru.'
       });
     }
 
