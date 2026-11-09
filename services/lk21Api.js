@@ -1,7 +1,22 @@
 import { exec } from 'child_process';
 import { promisify } from 'util';
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 const execAsync = promisify(exec);
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+let lk21StreamsCatalog = {};
+try {
+  const catalogPath = path.join(__dirname, '..', 'database', 'lk21_streams_cache.json');
+  if (fs.existsSync(catalogPath)) {
+    lk21StreamsCatalog = JSON.parse(fs.readFileSync(catalogPath, 'utf8'));
+  }
+} catch (err) {
+  console.warn('Could not load lk21_streams_cache.json:', err.message);
+}
 
 const LK21_BASE = 'https://tv12.lk21official.cc';
 const LK21_SEARCH_API = 'https://gudangvape.com/search.php';
@@ -264,13 +279,23 @@ export async function getLk21Movies({ category = 'populer', genre = '', genres =
               title: rawTitle,
               poster: posterUrl,
               rating: item.rating && Number(item.rating) > 0 ? String(item.rating) : '7.5',
-              genres: genreList.length > 0 ? genreList.join(', ') : 'Movie, LK21',
+              genres: lk21StreamsCatalog[slug]?.genres || (genreList.length > 0 ? genreList.join(', ') : 'Movie, LK21'),
               year: itemYear,
               quality: String(item.quality || 'HD').toUpperCase(),
               isTrailer: false,
               url: `${LK21_BASE}/${slug}`
             };
           });
+
+        // Filter by requested genres if user selected a genre on Vercel
+        if (genreList.length > 0) {
+          const filtered = list.filter(m =>
+            genreList.every(g => (m.genres || '').toLowerCase().includes(g.toLowerCase()))
+          );
+          if (filtered.length > 0) {
+            list = filtered;
+          }
+        }
       }
     }
 
@@ -541,6 +566,21 @@ export async function getLk21MovieDetail(slug) {
     let finalQuality = rawQuality;
     let finalDuration = duration;
     let finalCast = cast;
+    let finalGenres = genres;
+    let finalCountry = country;
+    let finalDirector = director;
+
+    const cachedEntry = lk21StreamsCatalog[slug];
+    if (cachedEntry) {
+      if (!finalSynopsis && cachedEntry.synopsis) finalSynopsis = cachedEntry.synopsis;
+      if ((!finalGenres || finalGenres === 'Action, Film Bioskop') && cachedEntry.genres) finalGenres = cachedEntry.genres;
+      if (!finalCountry && cachedEntry.country) finalCountry = cachedEntry.country;
+      if (!finalDirector && cachedEntry.director) finalDirector = cachedEntry.director;
+      if (!finalCast && cachedEntry.cast) finalCast = cachedEntry.cast;
+      if (servers.length === 0 && Array.isArray(cachedEntry.servers) && cachedEntry.servers.length > 0) {
+        servers.push(...cachedEntry.servers);
+      }
+    }
 
     const isCloudflareBlocked =
       !finalTitle ||
@@ -687,10 +727,10 @@ export async function getLk21MovieDetail(slug) {
       banner: finalPoster,
       rating: finalRating,
       year: finalYear,
-      genres,
-      country,
+      genres: finalGenres,
+      country: finalCountry,
       duration: finalDuration,
-      director,
+      director: finalDirector,
       cast: finalCast,
       url,
       quality: finalQuality,
