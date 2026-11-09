@@ -1,7 +1,33 @@
 import express from 'express';
 import { db } from '../database/db.js';
+import { performSmartMerge } from '../services/syncService.js';
 
 const router = express.Router();
+
+// 0. Bidirectional Smart Sync (Used on login, registration, and background sync)
+router.post('/bidirectional', (req, res) => {
+  try {
+    const { userId = 'guest_user', localBookmarks = [], localHistory = [] } = req.body;
+    if (!userId) {
+      return res.status(400).json({ success: false, message: 'userId wajib disertakan' });
+    }
+
+    const result = performSmartMerge(userId, localBookmarks, localHistory);
+    res.json({
+      success: true,
+      message: 'Sinkronisasi riwayat dan bookmark berhasil',
+      bookmarks: result.bookmarks,
+      history: result.history,
+      stats: {
+        bookmarksCount: result.bookmarks.length,
+        historyCount: result.history.length
+      }
+    });
+  } catch (error) {
+    console.error('Bidirectional sync error:', error);
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
 
 // 1. Export all bookmarks and watch history
 router.get('/export', (req, res) => {
@@ -37,89 +63,14 @@ router.post('/import', (req, res) => {
   try {
     const { bookmarks = [], watch_history = [], userId = 'guest_user' } = req.body;
 
-    let bookmarkImported = 0;
-    let historyImported = 0;
-
-    // Prepared statements
-    const insertBookmark = db.prepare(`
-      INSERT INTO bookmarks (user_id, anime_id, anime_title, anime_poster, anime_banner, anime_status, anime_genres, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(user_id, anime_id) DO UPDATE SET
-        anime_title = excluded.anime_title,
-        anime_poster = excluded.anime_poster,
-        anime_banner = excluded.anime_banner,
-        anime_status = excluded.anime_status,
-        anime_genres = excluded.anime_genres
-    `);
-
-    const insertHistory = db.prepare(`
-      INSERT INTO watch_history (
-        user_id, anime_id, anime_title, anime_poster,
-        episode_id, episode_number, episode_title,
-        progress_seconds, duration_seconds, is_completed, last_watched_at
-      )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(user_id, anime_id) DO UPDATE SET
-        anime_title = excluded.anime_title,
-        anime_poster = excluded.anime_poster,
-        episode_id = excluded.episode_id,
-        episode_number = excluded.episode_number,
-        episode_title = excluded.episode_title,
-        progress_seconds = excluded.progress_seconds,
-        duration_seconds = excluded.duration_seconds,
-        is_completed = excluded.is_completed,
-        last_watched_at = excluded.last_watched_at
-    `);
-
-    // Import Bookmarks
-    for (const b of bookmarks) {
-      if (!b.anime_id) continue;
-      try {
-        insertBookmark.run(
-          userId,
-          parseInt(b.anime_id),
-          b.anime_title || '',
-          b.anime_poster || '',
-          b.anime_banner || '',
-          b.anime_status || '',
-          b.anime_genres || '',
-          b.created_at || new Date().toISOString()
-        );
-        bookmarkImported++;
-      } catch (err) {
-        console.error('Error importing single bookmark:', err.message);
-      }
-    }
-
-    // Import Watch History
-    for (const h of watch_history) {
-      if (!h.anime_id || !h.episode_id) continue;
-      try {
-        insertHistory.run(
-          userId,
-          parseInt(h.anime_id),
-          h.anime_title || '',
-          h.anime_poster || '',
-          parseInt(h.episode_id),
-          String(h.episode_number || '1'),
-          h.episode_title || '',
-          parseInt(h.progress_seconds) || 0,
-          parseInt(h.duration_seconds) || 1440,
-          h.is_completed ? 1 : 0,
-          h.last_watched_at || new Date().toISOString()
-        );
-        historyImported++;
-      } catch (err) {
-        console.error('Error importing single history:', err.message);
-      }
-    }
+    const result = performSmartMerge(userId, bookmarks, watch_history);
 
     res.json({
       success: true,
-      message: `Berhasil mengimpor ${bookmarkImported} bookmark dan ${historyImported} riwayat tonton.`,
+      message: `Berhasil menyinkronkan ${result.bookmarks.length} bookmark dan ${result.history.length} riwayat tonton.`,
       stats: {
-        imported_bookmarks: bookmarkImported,
-        imported_history: historyImported
+        bookmarksCount: result.bookmarks.length,
+        historyCount: result.history.length
       }
     });
   } catch (error) {

@@ -2,6 +2,7 @@ import express from 'express';
 import crypto from 'node:crypto';
 import { db } from '../database/db.js';
 import { sendOtpEmail } from '../services/emailService.js';
+import { performSmartMerge } from '../services/syncService.js';
 
 const router = express.Router();
 
@@ -37,8 +38,8 @@ function migrateGuestData(guestUserId, targetUsername) {
     // 2. Migrate watch history
     const guestHistory = db.prepare('SELECT * FROM watch_history WHERE user_id = ?').all(guestUserId);
     const insertHist = db.prepare(`
-      INSERT INTO watch_history (user_id, anime_id, anime_title, anime_poster, episode_id, episode_number, episode_title, progress_seconds, duration_seconds, is_completed, type, resume_route)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO watch_history (user_id, anime_id, anime_title, anime_poster, episode_id, episode_number, episode_title, progress_seconds, duration_seconds, is_completed, type, resume_route, watched_episodes, last_watched_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
       ON CONFLICT(user_id, anime_id) DO UPDATE SET
         episode_id = excluded.episode_id,
         episode_number = excluded.episode_number,
@@ -48,6 +49,7 @@ function migrateGuestData(guestUserId, targetUsername) {
         is_completed = excluded.is_completed,
         type = excluded.type,
         resume_route = excluded.resume_route,
+        watched_episodes = excluded.watched_episodes,
         last_watched_at = CURRENT_TIMESTAMP
     `);
     for (const h of guestHistory) {
@@ -63,24 +65,33 @@ function migrateGuestData(guestUserId, targetUsername) {
         h.duration_seconds,
         h.is_completed || 0,
         h.type || 'anime',
-        h.resume_route || ''
+        h.resume_route || '',
+        h.watched_episodes || '[]'
       );
     }
     db.prepare('DELETE FROM watch_history WHERE user_id = ?').run(guestUserId);
   } catch (err) {
-    console.warn('Guest data migration error:', err.message);
+    console.warn('Guest data migration warning:', err.message);
   }
 }
 
-// POST /api/auth/register (Email & Password registration)
+// POST /api/auth/register (Email, Password, DisplayName + Auto-Login + Instant Smart Merge)
 router.post('/register', (req, res) => {
   try {
-    const { email = '', username = '', password = '', displayName = '', guestUserId = '' } = req.body;
+    const { 
+      email = '', 
+      username = '', 
+      password = '', 
+      displayName = '', 
+      guestUserId = '',
+      localBookmarks = [],
+      localHistory = []
+    } = req.body;
 
     const cleanEmail = email.trim().toLowerCase();
     let cleanUser = username.trim().toLowerCase();
 
-    // If username not provided, generate from email
+    // If username not provided, generate from email prefix
     if (!cleanUser && cleanEmail) {
       cleanUser = cleanEmail.split('@')[0].replace(/[^a-zA-Z0-9_]/g, '_');
     }
@@ -107,7 +118,7 @@ router.post('/register', (req, res) => {
 
     if (existing) {
       if (cleanEmail && existing.email && existing.email.toLowerCase() === cleanEmail) {
-        return res.status(400).json({ success: false, message: 'Email sudah terdaftar. Silakan gunakan menu Lupa Password jika lupa kata sandi.' });
+        return res.status(400).json({ success: false, message: 'Email sudah terdaftar. Silakan masuk atau gunakan menu Lupa Password.' });
       }
       return res.status(400).json({ success: false, message: 'Username atau email sudah digunakan.' });
     }
@@ -125,6 +136,9 @@ router.post('/register', (req, res) => {
       migrateGuestData(guestUserId, cleanUser);
     }
 
+    // Immediately perform bidirectional smart merge with client data
+    const merged = performSmartMerge(cleanUser, localBookmarks, localHistory);
+
     const newUser = {
       id: Number(result.lastInsertRowid),
       username: cleanUser,
@@ -136,8 +150,14 @@ router.post('/register', (req, res) => {
 
     res.json({
       success: true,
-      message: 'Pendaftaran akun berhasil!',
-      user: newUser
+      message: `Pendaftaran berhasil! Selamat datang, ${cleanName}.`,
+      user: newUser,
+      bookmarks: merged.bookmarks,
+      history: merged.history,
+      stats: {
+        bookmarksCount: merged.bookmarks.length,
+        historyCount: merged.history.length
+      }
     });
   } catch (error) {
     console.error('Register error:', error);
@@ -145,10 +165,18 @@ router.post('/register', (req, res) => {
   }
 });
 
-// POST /api/auth/login (Login with Email or Username + Password)
+// POST /api/auth/login (Login with Email or Username + Password + Smart Merge)
 router.post('/login', (req, res) => {
   try {
-    const { email = '', username = '', password = '', guestUserId = '' } = req.body;
+    const { 
+      email = '', 
+      username = '', 
+      password = '', 
+      guestUserId = '',
+      localBookmarks = [],
+      localHistory = [],
+      clientCachedUser = null
+    } = req.body;
     const identifier = (email || username || '').trim().toLowerCase();
 
     if (!identifier || !password) {
@@ -156,11 +184,33 @@ router.post('/login', (req, res) => {
     }
 
     // Look up by email or username
-    const user = db.prepare(`
+    let user = db.prepare(`
       SELECT * FROM users 
       WHERE (email IS NOT NULL AND LOWER(email) = ?) 
          OR LOWER(username) = ?
     `).get(identifier, identifier);
+
+    // Resiliency: If running on fresh serverless cold-start container on Vercel
+    // where local SQLite does not yet have this user, re-create from clientCachedUser
+    if (!user && clientCachedUser && (clientCachedUser.email === identifier || clientCachedUser.username === identifier)) {
+      try {
+        const salt = crypto.randomBytes(16).toString('hex');
+        const passwordHash = hashPassword(password, salt);
+        const uName = clientCachedUser.username || identifier.split('@')[0];
+        const dName = clientCachedUser.displayName || uName;
+        const uEmail = clientCachedUser.email || (identifier.includes('@') ? identifier : null);
+        const uAvatar = clientCachedUser.avatar || `https://api.dicebear.com/7.x/bottts/svg?seed=${encodeURIComponent(uName)}`;
+
+        db.prepare(`
+          INSERT INTO users (username, email, password_hash, salt, display_name, avatar)
+          VALUES (?, ?, ?, ?, ?, ?)
+        `).run(uName, uEmail, passwordHash, salt, dName, uAvatar);
+
+        user = db.prepare('SELECT * FROM users WHERE LOWER(username) = ?').get(uName);
+      } catch (e) {
+        console.warn('Re-creating user for container failed:', e.message);
+      }
+    }
 
     if (!user) {
       return res.status(401).json({ success: false, message: 'Email atau kata sandi tidak sesuai.' });
@@ -175,6 +225,9 @@ router.post('/login', (req, res) => {
       migrateGuestData(guestUserId, user.username);
     }
 
+    // Smart merge local bookmarks and history into user database
+    const merged = performSmartMerge(user.username, localBookmarks, localHistory);
+
     const userPayload = {
       id: user.id,
       username: user.username,
@@ -187,10 +240,33 @@ router.post('/login', (req, res) => {
     res.json({
       success: true,
       message: `Selamat datang kembali, ${userPayload.displayName}!`,
-      user: userPayload
+      user: userPayload,
+      bookmarks: merged.bookmarks,
+      history: merged.history,
+      stats: {
+        bookmarksCount: merged.bookmarks.length,
+        historyCount: merged.history.length
+      }
     });
   } catch (error) {
     console.error('Login error:', error);
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// POST /api/auth/logout (Safely sync final state to database before clearing client session)
+router.post('/logout', (req, res) => {
+  try {
+    const { userId = '', localBookmarks = [], localHistory = [] } = req.body;
+    if (userId && userId !== 'guest_user') {
+      performSmartMerge(userId, localBookmarks, localHistory);
+    }
+    res.json({
+      success: true,
+      message: 'Berhasil keluar dan data Anda telah diamankan di server.'
+    });
+  } catch (error) {
+    console.error('Logout error:', error);
     res.status(500).json({ success: false, message: error.message });
   }
 });
