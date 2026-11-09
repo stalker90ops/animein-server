@@ -78,16 +78,13 @@ process.on('unhandledRejection', (reason) => {
   console.warn('Caught unhandledRejection:', reason?.message || reason);
 });
 
-// Only listen if not running in a serverless environment (like Vercel)
-if (!process.env.VERCEL) {
-  app.listen(PORT, () => {
-    console.log(`====================================================`);
-    console.log(`🚀 AnimeIn Web Platform is LIVE!`);
-    console.log(`🌐 URL: http://localhost:${PORT}`);
-    console.log(`📦 Database: SQLite (animein.db)`);
-    console.log(`📡 Connected to Live animeinweb.com APIs`);
-    console.log(`====================================================`);
-  });
-}
+app.listen(PORT, () => {
+  console.log(`====================================================`);
+  console.log(`🚀 AnimeIn Web Platform is LIVE!`);
+  console.log(`🌐 URL: http://localhost:${PORT}`);
+  console.log(`📦 Database: SQLite (animein.db)`);
+  console.log(`📡 Connected to Live animeinweb.com APIs`);
+  console.log(`====================================================`);
+});
 
 export default app;
