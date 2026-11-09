@@ -167,6 +167,83 @@ router.get('/lk21/embed-frame', async (req, res) => {
     const { url } = req.query;
     if (!url) return res.status(400).send('URL embed diperlukan');
 
+    // 1. Direct Resolution: If videonode/p2p stream can be resolved to direct HLS m3u8,
+    // render a clean, fast, ad-free cinema Hls.js player without relying on external buggy scripts
+    let resolvedStream = null;
+    try {
+      resolvedStream = await resolveLk21Stream(url);
+    } catch (_) {}
+
+    if (resolvedStream) {
+      const streamProxyUrl = `/api/movies/lk21/stream.m3u8?fileUrl=${encodeURIComponent(resolvedStream)}`;
+      const playerHtml = `<!DOCTYPE html>
+<html lang="id">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AnimeIn Cinema Player</title>
+  <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
+  <style>
+    * { box-sizing: border-box; }
+    body, html { margin:0; padding:0; width:100%; height:100%; overflow:hidden; background:#000; font-family:system-ui,-apple-system,sans-serif; }
+    #wrapper { position:relative; width:100%; height:100%; display:flex; align-items:center; justify-content:center; background:#000; }
+    video { width:100%; height:100%; object-fit:contain; }
+    #spinner { position:absolute; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center; background:rgba(0,0,0,0.75); z-index:10; color:#e2e8f0; font-size:13px; font-weight:600; }
+    .spin { width:40px; height:40px; border:3px solid rgba(239,68,68,0.2); border-top-color:#ef4444; border-radius:50%; animation:spin 0.8s linear infinite; margin-bottom:12px; }
+    @keyframes spin { to { transform:rotate(360deg); } }
+  </style>
+</head>
+<body>
+  <div id="wrapper">
+    <div id="spinner"><div class="spin"></div><span>Menghubungkan ke server stream HD...</span></div>
+    <video id="player" controls autoplay playsinline preload="auto"></video>
+  </div>
+  <script>
+    const video = document.getElementById('player');
+    const spinner = document.getElementById('spinner');
+    const src = ${JSON.stringify(streamProxyUrl)};
+
+    function hideSpinner() {
+      if (spinner) spinner.style.display = 'none';
+    }
+
+    video.addEventListener('playing', hideSpinner);
+    video.addEventListener('canplay', hideSpinner);
+
+    if (Hls.isSupported()) {
+      const hls = new Hls({
+        enableWorker: true,
+        lowLatencyMode: false,
+        maxBufferLength: 30,
+        maxMaxBufferLength: 60
+      });
+      hls.loadSource(src);
+      hls.attachMedia(video);
+      hls.on(Hls.Events.MANIFEST_PARSED, () => {
+        hideSpinner();
+        video.play().catch(() => {});
+      });
+      hls.on(Hls.Events.ERROR, (_, d) => {
+        if (d.fatal) {
+          spinner.innerHTML = '<span style="color:#ef4444;padding:12px 20px;background:rgba(0,0,0,0.85);border-radius:12px;border:1px solid rgba(239,68,68,0.3)">Gagal memuat video segmen. Silakan muat ulang atau pilih server lain.</span>';
+        }
+      });
+    } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+      video.src = src;
+      video.addEventListener('loadedmetadata', () => {
+        hideSpinner();
+        video.play().catch(() => {});
+      });
+    }
+  </script>
+</body>
+</html>`;
+
+      res.setHeader('Content-Type', 'text/html; charset=utf-8');
+      res.setHeader('Access-Control-Allow-Origin', '*');
+      return res.send(playerHtml);
+    }
+
     let targetUrl = url;
 
     // If url is a videonode iframe, query videonode api to get actual inner player URL
