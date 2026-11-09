@@ -1,0 +1,52 @@
+========================================================================
+PANDUAN LENGKAP: ANIMEIN SERVER STANDALONE DI ANDROID TV BOX
+(Bebas dari PC - Android TV Box Menjadi Server Mandiri)
+========================================================================
+
+Dengan panduan ini, Android TV Box Anda akan menjalankan server lokal AnimeIn
+secara mandiri. Anda BISA menonton kapan saja meskipun PC MATI TOTAL!
+
+------------------------------------------------------------------------
+LANGKAH 1: PERSIAPAN DI ANDROID TV BOX
+------------------------------------------------------------------------
+1. Pasang dua aplikasi gratis ini di Android TV Box Anda (tersedia di F-Droid
+   atau via browser/USB flashdisk):
+   - Termux (Terminal Android)
+   - Termux:Boot (Agar otomatis menyala saat TV dihidupkan)
+   * Link download resmi: https://f-droid.org/packages/com.termux/
+
+------------------------------------------------------------------------
+LANGKAH 2: SALIN FOLDER SERVER KE ANDROID TV BOX
+------------------------------------------------------------------------
+1. Salin file 'AnimeIn-Android-Server.zip' ke flashdisk USB, lalu colok ke TV Box.
+2. Ekstrak folder 'AnimeIn-Standalone-Server' ke penyimpanan TV Box
+   (misalnya di /sdcard/AnimeIn-Standalone-Server atau di memori internal).
+
+------------------------------------------------------------------------
+LANGKAH 3: AKTIFKAN AUTO-START (HANYA SEKALI SAJA)
+------------------------------------------------------------------------
+1. Buka aplikasi Termux di TV Box.
+2. Berikan izin penyimpanan jika diminta:
+     termux-setup-storage
+3. Masuk ke folder AnimeIn:
+     cd /sdcard/AnimeIn-Standalone-Server
+   (atau sesuaikan dengan letak folder Anda).
+4. Jalankan perintah auto-start:
+     sh setup-autostart.sh
+
+   Skrip ini otomatis:
+   - Memasang Node.js LTS
+   - Mengonfigurasi Termux:Boot
+   - Menjalankan server di background pada port 5000
+
+------------------------------------------------------------------------
+LANGKAH 4: BUKA APLIKASI ANIMEIN TV (APK)
+------------------------------------------------------------------------
+1. Pasang file 'AnimeIn-TV-Release.apk' di Android TV Anda.
+2. Buka AnimeIn TV.
+3. Aplikasi akan langsung terhubung ke:
+     http://127.0.0.1:5000/tv?mode=tv
+   (Lokal di TV Box itu sendiri!).
+4. Selamat! Anda bisa menikmati nonton anime, film, dan drama kapan pun
+   tanpa perlu menyalakan PC Anda lagi.
+========================================================================

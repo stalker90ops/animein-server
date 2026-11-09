@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: animein-web-platform
+    env: node
+    plan: free
+    buildCommand: npm install --omit=dev
+    startCommand: node server.js
+    envVars:
+      - key: NODE_VERSION
+        value: 22.12.0
