@@ -1,5 +1,3 @@
-import nodemailer from 'nodemailer';
-
 /**
  * Send 6-digit OTP verification email for password reset
  * Supports SMTP (Gmail, custom mailer) or fallback development log
@@ -20,6 +18,9 @@ export async function sendOtpEmail(toEmail, otp, recipientName = '') {
 
   if (smtpUser && smtpPass) {
     try {
+      const nodemailerModule = await import('nodemailer');
+      const nodemailer = nodemailerModule.default || nodemailerModule;
+
       const transporter = nodemailer.createTransport({
         host: process.env.SMTP_HOST || 'smtp.gmail.com',
         port: parseInt(process.env.SMTP_PORT, 10) || 587,
@@ -34,7 +35,7 @@ export async function sendOtpEmail(toEmail, otp, recipientName = '') {
         from: process.env.SMTP_FROM || `"AnimeIn Support" <${smtpUser}>`,
         to: cleanEmail,
         subject: `[AnimeIn] Kode OTP Reset Kata Sandi: ${otp}`,
-        text: `Halo ${name},\n\nKode OTP untuk mengatur ulang kata sandi akun AnimeIn Anda adalah: ${otp}\n\nKode ini hanya berlaku selama 15 menit. Jangan berikan kode ini kepada siapapun demi keamanan akun Anda.\n\nSalam,\nTim AnimeIn`,
+        text: `Halo ${name},\n\nKode OTP untuk mengatur ulang kata sandi akun AnimeIn Anda adalah: ${otp}\n\nKode ini berlaku selama 15 menit. Jangan berikan kode ini kepada siapapun demi keamanan akun Anda.\n\nSalam,\nTim AnimeIn`,
         html: `
           <div style="font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; max-width: 520px; margin: 0 auto; background: #0B0F19; color: #f3f4f6; border-radius: 20px; overflow: hidden; border: 1px solid #1f2937;">
             <div style="background: linear-gradient(135deg, #E50914, #991b1b); padding: 24px; text-align: center;">
